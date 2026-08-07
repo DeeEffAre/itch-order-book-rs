@@ -6,6 +6,7 @@ use std::{
 use crate::itch_parser::{
     add_order::{AddOrderNoMPID, AddOrderWithMPID},
     handler::MessageHandler,
+    modify_order::order_execute::OrderExecuteWithPrice,
 };
 
 mod order;
@@ -13,10 +14,10 @@ mod order;
 #[derive(Default)]
 pub struct OrderBook {
     // bids sorted high to low
-    pub bids: BTreeMap<Reverse<order::Price>, VecDeque<order::Order>>,
+    pub bids: BTreeMap<Reverse<order::Price>, VecDeque<order::Id>>,
 
     // asks sorted low to high
-    pub asks: BTreeMap<order::Price, VecDeque<order::Order>>,
+    pub asks: BTreeMap<order::Price, VecDeque<order::Id>>,
 
     pub order_pool: HashMap<order::Id, order::Order>,
 }
@@ -25,28 +26,28 @@ impl MessageHandler for OrderBook {
     fn on_add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) {
         let order = order::Order::try_from(msg).expect("Invalid add order format");
         self.order_pool
-            .insert(order::Id(msg.order_ref_number.get()), order.clone());
+            .insert(msg.order_ref_number.get().into(), order.clone());
 
         match order.side {
             order::Side::Buy => {
                 if self.bids.contains_key(&Reverse(order.price)) {
                     let vdeq = self.bids.get_mut(&Reverse(order.price)).unwrap();
-                    vdeq.push_back(order);
+                    vdeq.push_back(order.id);
                 } else {
                     let order_price = order.price;
                     let mut vdeq = VecDeque::new();
-                    vdeq.push_back(order);
+                    vdeq.push_back(order.id);
                     self.bids.insert(Reverse(order_price), vdeq);
                 }
             }
             order::Side::Sell => {
                 if self.asks.contains_key(&order.price) {
                     let vdeq = self.asks.get_mut(&order.price).unwrap();
-                    vdeq.push_back(order);
+                    vdeq.push_back(order.id);
                 } else {
                     let order_price = order.price;
                     let mut vdeq = VecDeque::new();
-                    vdeq.push_back(order);
+                    vdeq.push_back(order.id);
                     self.asks.insert(order_price, vdeq);
                 }
             }
@@ -55,28 +56,81 @@ impl MessageHandler for OrderBook {
 
     fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) {
         let order = order::Order::try_from(msg).expect("Invalid add order format");
+        self.order_pool
+            .insert(msg.order_ref_number.get().into(), order.clone());
 
         match order.side {
             order::Side::Buy => {
                 if self.bids.contains_key(&Reverse(order.price)) {
                     let vdeq = self.bids.get_mut(&Reverse(order.price)).unwrap();
-                    vdeq.push_back(order);
+                    vdeq.push_back(order.id);
                 } else {
                     let order_price = order.price;
                     let mut vdeq = VecDeque::new();
-                    vdeq.push_back(order);
+                    vdeq.push_back(order.id);
                     self.bids.insert(Reverse(order_price), vdeq);
                 }
             }
             order::Side::Sell => {
                 if self.asks.contains_key(&order.price) {
                     let vdeq = self.asks.get_mut(&order.price).unwrap();
-                    vdeq.push_back(order);
+                    vdeq.push_back(order.id);
                 } else {
                     let order_price = order.price;
                     let mut vdeq = VecDeque::new();
-                    vdeq.push_back(order);
+                    vdeq.push_back(order.id);
                     self.asks.insert(order_price, vdeq);
+                }
+            }
+        }
+    }
+
+    fn on_order_execute_with_price(&mut self, msg: &OrderExecuteWithPrice) {
+        let order_id = msg.order_ref_number.get();
+
+        let Some(order) = self.order_pool.get_mut(&order_id) else {
+            return;
+        };
+
+        order.shares -= msg.executed_shares.get();
+        let fully_done = order.shares.0 == 0;
+
+        if !fully_done {
+            return;
+        }
+
+        let Some(order) = self.order_pool.remove(&order_id) else {
+            return;
+        };
+
+        self.remove_from_queue(order.side, order.price, order.id);
+    }
+}
+
+impl OrderBook {
+    fn remove_from_queue(&mut self, side: order::Side, price: order::Price, id: order::Id) {
+        let removed = match side {
+            order::Side::Buy => self.bids.get_mut(&Reverse(price)).map(|q| {
+                if let Some(idx) = q.iter().position(|&x| x == id) {
+                    q.remove(idx);
+                }
+                q.is_empty()
+            }),
+            order::Side::Sell => self.asks.get_mut(&price).map(|q| {
+                if let Some(idx) = q.iter().position(|&x| x == id) {
+                    q.remove(idx);
+                }
+                q.is_empty()
+            }),
+        };
+
+        if matches!(removed, Some(true)) {
+            match side {
+                order::Side::Buy => {
+                    self.bids.remove(&Reverse(price));
+                }
+                order::Side::Sell => {
+                    self.asks.remove(&price);
                 }
             }
         }
@@ -151,11 +205,12 @@ mod tests {
         assert!(ob.bids.contains_key(&expected_price));
         let orders = ob.bids.get(&expected_price).unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].id, Id(ID));
-        assert_eq!(orders[0].shares, Quantity(SHARES));
-        assert_eq!(orders[0].side, Side::Buy);
-        assert_eq!(orders[0].price, Price::from(PRICE));
-        assert_eq!(orders[0].timestamp, Timestamp(TS));
+        assert_eq!(orders[0], Id(ID));
+        let order = ob.order_pool.get(&orders[0]).unwrap();
+        assert_eq!(order.shares, Quantity(SHARES));
+        assert_eq!(order.side, Side::Buy);
+        assert_eq!(order.price, Price::from(PRICE));
+        assert_eq!(order.timestamp, Timestamp(TS));
         assert!(ob.asks.is_empty());
     }
 
@@ -177,11 +232,12 @@ mod tests {
         assert!(ob.asks.contains_key(&expected_price));
         let orders = ob.asks.get(&expected_price).unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].id, Id(ID));
-        assert_eq!(orders[0].shares, Quantity(SHARES));
-        assert_eq!(orders[0].side, Side::Sell);
-        assert_eq!(orders[0].price, Price::from(PRICE));
-        assert_eq!(orders[0].timestamp, Timestamp(TS));
+        assert_eq!(orders[0], Id(ID));
+        let order = ob.order_pool.get(&orders[0]).unwrap();
+        assert_eq!(order.shares, Quantity(SHARES));
+        assert_eq!(order.side, Side::Sell);
+        assert_eq!(order.price, Price::from(PRICE));
+        assert_eq!(order.timestamp, Timestamp(TS));
         assert!(ob.bids.is_empty());
     }
 
@@ -206,8 +262,8 @@ mod tests {
         let expected_price = Reverse(Price::from(PRICE));
         let orders = ob.bids.get(&expected_price).unwrap();
         assert_eq!(orders.len(), 2);
-        assert_eq!(orders[0].id, Id(ID_1));
-        assert_eq!(orders[1].id, Id(ID_2));
+        assert_eq!(orders[0], Id(ID_1));
+        assert_eq!(orders[1], Id(ID_2));
     }
 
     #[test]
@@ -231,8 +287,8 @@ mod tests {
         let expected_price = Price::from(PRICE);
         let orders = ob.asks.get(&expected_price).unwrap();
         assert_eq!(orders.len(), 2);
-        assert_eq!(orders[0].id, Id(ID_1));
-        assert_eq!(orders[1].id, Id(ID_2));
+        assert_eq!(orders[0], Id(ID_1));
+        assert_eq!(orders[1], Id(ID_2));
     }
 
     #[test]
@@ -318,11 +374,12 @@ mod tests {
         assert!(ob.bids.contains_key(&expected_price));
         let orders = ob.bids.get(&expected_price).unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].id, Id(ID));
-        assert_eq!(orders[0].shares, Quantity(SHARES));
-        assert_eq!(orders[0].side, Side::Buy);
-        assert_eq!(orders[0].price, Price::from(PRICE));
-        assert_eq!(orders[0].timestamp, Timestamp(TS));
+        assert_eq!(orders[0], Id(ID));
+        let order = ob.order_pool.get(&orders[0]).unwrap();
+        assert_eq!(order.shares, Quantity(SHARES));
+        assert_eq!(order.side, Side::Buy);
+        assert_eq!(order.price, Price::from(PRICE));
+        assert_eq!(order.timestamp, Timestamp(TS));
         assert!(ob.asks.is_empty());
     }
 
@@ -345,11 +402,12 @@ mod tests {
         assert!(ob.asks.contains_key(&expected_price));
         let orders = ob.asks.get(&expected_price).unwrap();
         assert_eq!(orders.len(), 1);
-        assert_eq!(orders[0].id, Id(ID));
-        assert_eq!(orders[0].shares, Quantity(SHARES));
-        assert_eq!(orders[0].side, Side::Sell);
-        assert_eq!(orders[0].price, Price::from(PRICE));
-        assert_eq!(orders[0].timestamp, Timestamp(TS));
+        assert_eq!(orders[0], Id(ID));
+        let order = ob.order_pool.get(&orders[0]).unwrap();
+        assert_eq!(order.shares, Quantity(SHARES));
+        assert_eq!(order.side, Side::Sell);
+        assert_eq!(order.price, Price::from(PRICE));
+        assert_eq!(order.timestamp, Timestamp(TS));
         assert!(ob.bids.is_empty());
     }
 
@@ -377,11 +435,11 @@ mod tests {
         assert_eq!(ob.bids.len(), 1);
         assert_eq!(ob.asks.len(), 1);
         assert_eq!(
-            ob.bids.get(&Reverse(Price::from(BUY_PRICE))).unwrap()[0].id,
+            ob.bids.get(&Reverse(Price::from(BUY_PRICE))).unwrap()[0],
             Id(BUY_ID)
         );
         assert_eq!(
-            ob.asks.get(&Price::from(SELL_PRICE)).unwrap()[0].id,
+            ob.asks.get(&Price::from(SELL_PRICE)).unwrap()[0],
             Id(SELL_ID)
         );
     }

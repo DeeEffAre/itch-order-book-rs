@@ -1,7 +1,21 @@
+use std::{borrow::Borrow, ops::SubAssign};
+
 use crate::itch_parser::add_order::{AddOrderNoMPID, AddOrderWithMPID};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Id(pub u64);
+
+impl From<u64> for Id {
+    fn from(value: u64) -> Self {
+        Id(value)
+    }
+}
+
+impl Borrow<u64> for Id {
+    fn borrow(&self) -> &u64 {
+        &self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Price(pub u64);
@@ -14,6 +28,12 @@ impl From<u32> for Price {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Quantity(pub u32);
+
+impl SubAssign<u32> for Quantity {
+    fn sub_assign(&mut self, rhs: u32) {
+        self.0 = self.0.checked_sub(rhs).expect("Negative share amount");
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
