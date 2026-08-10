@@ -6,7 +6,10 @@ use std::{
 use crate::itch_parser::{
     add_order::{AddOrderNoMPID, AddOrderWithMPID},
     handler::MessageHandler,
-    modify_order::order_execute::OrderExecuteWithPrice,
+    modify_order::{
+        order_delete::OrderDelete,
+        order_execute::{OrderExecute, OrderExecuteWithPrice},
+    },
 };
 
 mod order;
@@ -105,21 +108,48 @@ impl MessageHandler for OrderBook {
 
         self.remove_from_queue(order.side, order.price, order.id);
     }
+
+    fn on_order_execute(&mut self, msg: &OrderExecute) {
+        let order_id = msg.order_ref_number.get();
+
+        let Some(order) = self.order_pool.get_mut(&order_id) else {
+            return;
+        };
+
+        order.shares -= msg.executed_shares.get();
+        let fully_done = order.shares.0 == 0;
+
+        if !fully_done {
+            return;
+        }
+
+        let Some(order) = self.order_pool.remove(&order_id) else {
+            return;
+        };
+
+        self.remove_from_queue(order.side, order.price, order.id);
+    }
+
+    fn on_order_delete(&mut self, msg: &OrderDelete) {
+        let order_id = msg.order_ref_number.get();
+
+        let Some(order) = self.order_pool.remove(&order_id) else {
+            return;
+        };
+
+        self.remove_from_queue(order.side, order.price, order.id);
+    }
 }
 
 impl OrderBook {
     fn remove_from_queue(&mut self, side: order::Side, price: order::Price, id: order::Id) {
         let removed = match side {
             order::Side::Buy => self.bids.get_mut(&Reverse(price)).map(|q| {
-                if let Some(idx) = q.iter().position(|&x| x == id) {
-                    q.remove(idx);
-                }
+                q.retain(|&x| x != id);
                 q.is_empty()
             }),
             order::Side::Sell => self.asks.get_mut(&price).map(|q| {
-                if let Some(idx) = q.iter().position(|&x| x == id) {
-                    q.remove(idx);
-                }
+                q.retain(|&x| x != id);
                 q.is_empty()
             }),
         };
