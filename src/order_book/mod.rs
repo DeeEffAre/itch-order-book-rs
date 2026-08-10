@@ -215,6 +215,51 @@ mod tests {
         buf
     }
 
+    fn build_order_execute(
+        order_ref_number: u64,
+        executed_shares: u32,
+        timestamp: u64,
+    ) -> [u8; 31] {
+        let mut buf = [0u8; 31];
+        buf[0] = b'E';
+        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
+        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
+        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
+        buf[19..23].copy_from_slice(&executed_shares.to_be_bytes());
+        buf[23..31].copy_from_slice(&9999u64.to_be_bytes());
+        buf
+    }
+
+    fn build_order_execute_with_price(
+        order_ref_number: u64,
+        executed_shares: u32,
+        timestamp: u64,
+        execution_price: u32,
+    ) -> [u8; 36] {
+        let mut buf = [0u8; 36];
+        buf[0] = b'C';
+        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
+        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
+        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
+        buf[19..23].copy_from_slice(&executed_shares.to_be_bytes());
+        buf[23..31].copy_from_slice(&8888u64.to_be_bytes());
+        buf[31] = b'Y';
+        buf[32..36].copy_from_slice(&execution_price.to_be_bytes());
+        buf
+    }
+
+    fn build_order_delete(order_ref_number: u64, timestamp: u64) -> [u8; 19] {
+        let mut buf = [0u8; 19];
+        buf[0] = b'D';
+        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
+        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
+        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
+        buf
+    }
+
     // ---- on_add_order_no_mpid ----
 
     #[test]
@@ -480,5 +525,231 @@ mod tests {
         assert!(ob.bids.is_empty());
         assert!(ob.asks.is_empty());
         assert!(ob.order_pool.is_empty());
+    }
+
+    // ---- on_order_execute ----
+
+    #[test]
+    fn execute_full_buy_order() {
+        const ID: u64 = 10;
+        const PRICE: u32 = 10000;
+        const SHARES: u32 = 200;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
+        );
+
+        let buf = build_order_execute(ID, SHARES, 100);
+        ob.on_order_execute(OrderExecute::new(&buf).unwrap());
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(
+            !ob.bids.contains_key(&expected_price),
+            "price level should be removed after last order executed"
+        );
+        assert!(
+            !ob.order_pool.contains_key(&Id(ID)),
+            "order should be removed from pool"
+        );
+    }
+
+    #[test]
+    fn execute_partial_buy_order() {
+        const ID: u64 = 11;
+        const PRICE: u32 = 10000;
+        const INITIAL_SHARES: u32 = 200;
+        const EXECUTED: u32 = 80;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                .unwrap(),
+        );
+
+        let buf = build_order_execute(ID, EXECUTED, 100);
+        ob.on_order_execute(OrderExecute::new(&buf).unwrap());
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(
+            ob.bids.contains_key(&expected_price),
+            "queue should still exist"
+        );
+        assert_eq!(ob.bids.get(&expected_price).unwrap().len(), 1);
+        assert_eq!(ob.bids.get(&expected_price).unwrap()[0], Id(ID));
+        let order = ob.order_pool.get(&Id(ID)).unwrap();
+        assert_eq!(order.shares, Quantity(INITIAL_SHARES - EXECUTED));
+    }
+
+    #[test]
+    fn execute_two_partials_become_full() {
+        const ID: u64 = 12;
+        const PRICE: u32 = 10000;
+        const INITIAL_SHARES: u32 = 200;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                .unwrap(),
+        );
+
+        ob.on_order_execute(OrderExecute::new(&build_order_execute(ID, 50, 100)).unwrap());
+        ob.on_order_execute(
+            OrderExecute::new(&build_order_execute(ID, INITIAL_SHARES - 50, 200)).unwrap(),
+        );
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(!ob.bids.contains_key(&expected_price));
+        assert!(!ob.order_pool.contains_key(&Id(ID)));
+    }
+
+    #[test]
+    fn execute_unknown_order_no_panic() {
+        let mut ob = OrderBook::default();
+        let buf = build_order_execute(999, 100, 1);
+        ob.on_order_execute(OrderExecute::new(&buf).unwrap());
+        // should not panic, nothing happens
+    }
+
+    #[test]
+    fn execute_full_sell_order() {
+        const ID: u64 = 20;
+        const PRICE: u32 = 15000;
+        const SHARES: u32 = 300;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
+        );
+
+        let buf = build_order_execute(ID, SHARES, 100);
+        ob.on_order_execute(OrderExecute::new(&buf).unwrap());
+
+        let expected_price = Price::from(PRICE);
+        assert!(!ob.asks.contains_key(&expected_price));
+        assert!(!ob.order_pool.contains_key(&Id(ID)));
+    }
+
+    // ---- on_order_execute_with_price ----
+
+    #[test]
+    fn execute_with_price_full_buy_order() {
+        const ID: u64 = 30;
+        const PRICE: u32 = 10000;
+        const SHARES: u32 = 100;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
+        );
+
+        let buf = build_order_execute_with_price(ID, SHARES, 100, PRICE);
+        ob.on_order_execute_with_price(OrderExecuteWithPrice::new(&buf).unwrap());
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(!ob.bids.contains_key(&expected_price));
+        assert!(!ob.order_pool.contains_key(&Id(ID)));
+    }
+
+    #[test]
+    fn execute_with_price_partial_buy_order() {
+        const ID: u64 = 31;
+        const PRICE: u32 = 10000;
+        const INITIAL_SHARES: u32 = 200;
+        const EXECUTED: u32 = 75;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                .unwrap(),
+        );
+
+        let buf = build_order_execute_with_price(ID, EXECUTED, 100, PRICE);
+        ob.on_order_execute_with_price(OrderExecuteWithPrice::new(&buf).unwrap());
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(ob.bids.contains_key(&expected_price));
+        assert_eq!(ob.bids.get(&expected_price).unwrap()[0], Id(ID));
+        let order = ob.order_pool.get(&Id(ID)).unwrap();
+        assert_eq!(order.shares, Quantity(INITIAL_SHARES - EXECUTED));
+    }
+
+    #[test]
+    fn execute_with_price_unknown_order_no_panic() {
+        let mut ob = OrderBook::default();
+        let buf = build_order_execute_with_price(999, 100, 1, 10000);
+        ob.on_order_execute_with_price(OrderExecuteWithPrice::new(&buf).unwrap());
+    }
+
+    // ---- on_order_delete ----
+
+    #[test]
+    fn delete_existing_buy_order() {
+        const ID: u64 = 40;
+        const PRICE: u32 = 10000;
+        const SHARES: u32 = 100;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
+        );
+
+        let buf = build_order_delete(ID, 100);
+        ob.on_order_delete(OrderDelete::new(&buf).unwrap());
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(!ob.bids.contains_key(&expected_price));
+        assert!(!ob.order_pool.contains_key(&Id(ID)));
+    }
+
+    #[test]
+    fn delete_one_of_two_at_same_price() {
+        const ID_1: u64 = 50;
+        const ID_2: u64 = 51;
+        const PRICE: u32 = 10000;
+        const SHARES: u32 = 100;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID_1, b'B', SHARES, PRICE, 1)).unwrap(),
+        );
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID_2, b'B', SHARES, PRICE, 2)).unwrap(),
+        );
+
+        ob.on_order_delete(OrderDelete::new(&build_order_delete(ID_1, 100)).unwrap());
+
+        let expected_price = Reverse(Price::from(PRICE));
+        let orders = ob.bids.get(&expected_price).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0], Id(ID_2));
+        assert!(!ob.order_pool.contains_key(&Id(ID_1)));
+        assert!(ob.order_pool.contains_key(&Id(ID_2)));
+    }
+
+    #[test]
+    fn delete_unknown_order_no_panic() {
+        let mut ob = OrderBook::default();
+        let buf = build_order_delete(999, 1);
+        ob.on_order_delete(OrderDelete::new(&buf).unwrap());
+    }
+
+    #[test]
+    fn delete_existing_sell_order() {
+        const ID: u64 = 60;
+        const PRICE: u32 = 15000;
+        const SHARES: u32 = 200;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
+        );
+
+        let buf = build_order_delete(ID, 100);
+        ob.on_order_delete(OrderDelete::new(&buf).unwrap());
+
+        let expected_price = Price::from(PRICE);
+        assert!(!ob.asks.contains_key(&expected_price));
+        assert!(!ob.order_pool.contains_key(&Id(ID)));
     }
 }
