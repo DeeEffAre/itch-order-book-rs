@@ -5,3 +5,15 @@ edition = "2024"
 
 [dependencies]
 zerocopy = { version = "0.8.55", features = ["derive"] }
+
+[dev-dependencies]
+criterion = "0.8.2"
+rand = "0.10.2"
+
+[[bench]]
+name = "order_book_ops"
+harness = false
+
+[[bench]]
+name = "itch_replay"
+harness = false

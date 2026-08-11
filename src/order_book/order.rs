@@ -13,7 +13,7 @@ pub struct Price(pub u64);
 
 impl From<u32> for Price {
     fn from(value: u32) -> Self {
-        Self((value * 10000).into())
+        Self(value.into())
     }
 }
 
