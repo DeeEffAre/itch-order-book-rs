@@ -12,6 +12,7 @@ use crate::itch_parser::{
         order_execute::{OrderExecute, OrderExecuteWithPrice},
         order_replace::OrderReplace,
     },
+    system_event_message::SystemEvent,
 };
 
 mod order;
@@ -202,6 +203,15 @@ impl MessageHandler for OrderBook {
             }
         }
     }
+
+    fn on_system_event(&mut self, msg: &SystemEvent) {
+        match msg.event_code {
+            b'O' | b'S' | b'E' | b'C' if !self.is_empty() => {
+                self.clear_all();
+            }
+            _ => {}
+        }
+    }
 }
 
 impl OrderBook {
@@ -227,6 +237,19 @@ impl OrderBook {
                 }
             }
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.order_pool.is_empty()
+    }
+
+    #[inline]
+    fn clear_all(&mut self) {
+        self.bids.clear();
+        self.asks.clear();
+        self.order_pool.clear();
     }
 }
 
@@ -354,6 +377,16 @@ mod tests {
         buf[19..27].copy_from_slice(&new_order_ref_number.to_be_bytes());
         buf[27..31].copy_from_slice(&shares.to_be_bytes());
         buf[31..35].copy_from_slice(&price.to_be_bytes());
+        buf
+    }
+
+    fn build_system_event(event_code: u8, timestamp: u64) -> [u8; 12] {
+        let mut buf = [0u8; 12];
+        buf[0] = b'S';
+        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
+        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
+        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf[11] = event_code;
         buf
     }
 
@@ -1037,5 +1070,104 @@ mod tests {
         assert!(ob.asks.contains_key(&Price::from(PRICE)));
         let new_order = ob.order_pool.get(&Id(NEW_ID)).unwrap();
         assert_eq!(new_order.side, Side::Sell);
+    }
+
+    // ---- on_system_event ----
+
+    #[test]
+    fn system_event_clears_non_empty_book() {
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
+        );
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(2, b'S', 50, 12000, 2)).unwrap(),
+        );
+        assert!(!ob.is_empty());
+
+        let buf = build_system_event(b'O', 100);
+        ob.on_system_event(SystemEvent::new(&buf).unwrap());
+
+        assert!(ob.is_empty());
+        assert!(ob.bids.is_empty());
+        assert!(ob.asks.is_empty());
+        assert!(ob.order_pool.is_empty());
+    }
+
+    #[test]
+    fn system_event_start_of_system_hours_clears() {
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
+        );
+
+        let buf = build_system_event(b'S', 100);
+        ob.on_system_event(SystemEvent::new(&buf).unwrap());
+
+        assert!(ob.is_empty());
+    }
+
+    #[test]
+    fn system_event_end_of_system_hours_clears() {
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
+        );
+
+        let buf = build_system_event(b'E', 100);
+        ob.on_system_event(SystemEvent::new(&buf).unwrap());
+
+        assert!(ob.is_empty());
+    }
+
+    #[test]
+    fn system_event_end_of_messages_clears() {
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
+        );
+
+        let buf = build_system_event(b'C', 100);
+        ob.on_system_event(SystemEvent::new(&buf).unwrap());
+
+        assert!(ob.is_empty());
+    }
+
+    #[test]
+    fn system_event_on_empty_book_no_panic() {
+        let mut ob = OrderBook::default();
+        assert!(ob.is_empty());
+
+        let buf = build_system_event(b'O', 100);
+        ob.on_system_event(SystemEvent::new(&buf).unwrap());
+
+        assert!(ob.is_empty());
+    }
+
+    #[test]
+    fn system_event_market_hours_does_not_clear() {
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
+        );
+
+        let buf = build_system_event(b'Q', 100);
+        ob.on_system_event(SystemEvent::new(&buf).unwrap());
+
+        assert!(!ob.is_empty());
+        assert_eq!(ob.bids.len(), 1);
+    }
+
+    #[test]
+    fn system_event_end_of_market_hours_does_not_clear() {
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
+        );
+
+        let buf = build_system_event(b'M', 100);
+        ob.on_system_event(SystemEvent::new(&buf).unwrap());
+
+        assert!(!ob.is_empty());
     }
 }
