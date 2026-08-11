@@ -7,8 +7,10 @@ use crate::itch_parser::{
     add_order::{AddOrderNoMPID, AddOrderWithMPID},
     handler::MessageHandler,
     modify_order::{
+        order_cancel::OrderCancel,
         order_delete::OrderDelete,
         order_execute::{OrderExecute, OrderExecuteWithPrice},
+        order_replace::OrderReplace,
     },
 };
 
@@ -28,8 +30,7 @@ pub struct OrderBook {
 impl MessageHandler for OrderBook {
     fn on_add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) {
         let order = order::Order::try_from(msg).expect("Invalid add order format");
-        self.order_pool
-            .insert(msg.order_ref_number.get().into(), order.clone());
+        self.order_pool.insert(order.id, order.clone());
 
         match order.side {
             order::Side::Buy => {
@@ -59,8 +60,7 @@ impl MessageHandler for OrderBook {
 
     fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) {
         let order = order::Order::try_from(msg).expect("Invalid add order format");
-        self.order_pool
-            .insert(msg.order_ref_number.get().into(), order.clone());
+        self.order_pool.insert(order.id, order.clone());
 
         match order.side {
             order::Side::Buy => {
@@ -89,7 +89,7 @@ impl MessageHandler for OrderBook {
     }
 
     fn on_order_execute_with_price(&mut self, msg: &OrderExecuteWithPrice) {
-        let order_id = msg.order_ref_number.get();
+        let order_id = order::Id(msg.order_ref_number.get());
 
         let Some(order) = self.order_pool.get_mut(&order_id) else {
             return;
@@ -110,7 +110,7 @@ impl MessageHandler for OrderBook {
     }
 
     fn on_order_execute(&mut self, msg: &OrderExecute) {
-        let order_id = msg.order_ref_number.get();
+        let order_id = order::Id(msg.order_ref_number.get());
 
         let Some(order) = self.order_pool.get_mut(&order_id) else {
             return;
@@ -131,13 +131,76 @@ impl MessageHandler for OrderBook {
     }
 
     fn on_order_delete(&mut self, msg: &OrderDelete) {
-        let order_id = msg.order_ref_number.get();
+        let order_id = order::Id(msg.order_ref_number.get());
 
         let Some(order) = self.order_pool.remove(&order_id) else {
             return;
         };
 
         self.remove_from_queue(order.side, order.price, order.id);
+    }
+
+    fn on_order_cancel(&mut self, msg: &OrderCancel) {
+        let order_id = order::Id(msg.order_ref_number.get());
+
+        let Some(order) = self.order_pool.get_mut(&order_id) else {
+            return;
+        };
+
+        order.shares -= msg.cancelled_shares.get();
+        let fully_done = order.shares.0 == 0;
+
+        if !fully_done {
+            return;
+        }
+
+        let Some(order) = self.order_pool.remove(&order_id) else {
+            return;
+        };
+
+        self.remove_from_queue(order.side, order.price, order.id);
+    }
+
+    fn on_order_replace(&mut self, msg: &OrderReplace) {
+        let order_id = order::Id(msg.org_order_ref_number.get());
+
+        let Some(order) = self.order_pool.remove(&order_id) else {
+            return;
+        };
+        // order replace doesn't contain the side info
+        let side = order.side;
+
+        self.remove_from_queue(order.side, order.price, order.id);
+
+        let mut order = order::Order::try_from(msg).expect("Invalid replace order format");
+        order.side = side;
+
+        self.order_pool.insert(order.id, order.clone());
+
+        match order.side {
+            order::Side::Buy => {
+                if self.bids.contains_key(&Reverse(order.price)) {
+                    let vdeq = self.bids.get_mut(&Reverse(order.price)).unwrap();
+                    vdeq.push_back(order.id);
+                } else {
+                    let order_price = order.price;
+                    let mut vdeq = VecDeque::new();
+                    vdeq.push_back(order.id);
+                    self.bids.insert(Reverse(order_price), vdeq);
+                }
+            }
+            order::Side::Sell => {
+                if self.asks.contains_key(&order.price) {
+                    let vdeq = self.asks.get_mut(&order.price).unwrap();
+                    vdeq.push_back(order.id);
+                } else {
+                    let order_price = order.price;
+                    let mut vdeq = VecDeque::new();
+                    vdeq.push_back(order.id);
+                    self.asks.insert(order_price, vdeq);
+                }
+            }
+        }
     }
 }
 
@@ -257,6 +320,40 @@ mod tests {
         buf[3..5].copy_from_slice(&200u16.to_be_bytes());
         buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
         buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
+        buf
+    }
+
+    fn build_order_cancel(
+        order_ref_number: u64,
+        cancelled_shares: u32,
+        timestamp: u64,
+    ) -> [u8; 23] {
+        let mut buf = [0u8; 23];
+        buf[0] = b'X';
+        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
+        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
+        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
+        buf[19..23].copy_from_slice(&cancelled_shares.to_be_bytes());
+        buf
+    }
+
+    fn build_order_replace(
+        org_order_ref_number: u64,
+        new_order_ref_number: u64,
+        shares: u32,
+        price: u32,
+        timestamp: u64,
+    ) -> [u8; 35] {
+        let mut buf = [0u8; 35];
+        buf[0] = b'U';
+        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
+        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
+        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
+        buf[11..19].copy_from_slice(&org_order_ref_number.to_be_bytes());
+        buf[19..27].copy_from_slice(&new_order_ref_number.to_be_bytes());
+        buf[27..31].copy_from_slice(&shares.to_be_bytes());
+        buf[31..35].copy_from_slice(&price.to_be_bytes());
         buf
     }
 
@@ -751,5 +848,194 @@ mod tests {
         let expected_price = Price::from(PRICE);
         assert!(!ob.asks.contains_key(&expected_price));
         assert!(!ob.order_pool.contains_key(&Id(ID)));
+    }
+
+    // ---- on_order_cancel ----
+
+    #[test]
+    fn cancel_all_shares_removes_order() {
+        const ID: u64 = 70;
+        const PRICE: u32 = 10000;
+        const SHARES: u32 = 500;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
+        );
+
+        let buf = build_order_cancel(ID, SHARES, 100);
+        ob.on_order_cancel(OrderCancel::new(&buf).unwrap());
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(!ob.bids.contains_key(&expected_price));
+        assert!(!ob.order_pool.contains_key(&Id(ID)));
+    }
+
+    #[test]
+    fn cancel_partial_shares_keeps_order() {
+        const ID: u64 = 71;
+        const PRICE: u32 = 10000;
+        const INITIAL_SHARES: u32 = 500;
+        const CANCELLED: u32 = 200;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                .unwrap(),
+        );
+
+        let buf = build_order_cancel(ID, CANCELLED, 100);
+        ob.on_order_cancel(OrderCancel::new(&buf).unwrap());
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(ob.bids.contains_key(&expected_price));
+        assert_eq!(ob.bids.get(&expected_price).unwrap()[0], Id(ID));
+        let order = ob.order_pool.get(&Id(ID)).unwrap();
+        assert_eq!(order.shares, Quantity(INITIAL_SHARES - CANCELLED));
+    }
+
+    #[test]
+    fn cancel_two_partials_become_full() {
+        const ID: u64 = 72;
+        const PRICE: u32 = 10000;
+        const INITIAL_SHARES: u32 = 400;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                .unwrap(),
+        );
+
+        ob.on_order_cancel(OrderCancel::new(&build_order_cancel(ID, 150, 100)).unwrap());
+        ob.on_order_cancel(
+            OrderCancel::new(&build_order_cancel(ID, INITIAL_SHARES - 150, 200)).unwrap(),
+        );
+
+        let expected_price = Reverse(Price::from(PRICE));
+        assert!(!ob.bids.contains_key(&expected_price));
+        assert!(!ob.order_pool.contains_key(&Id(ID)));
+    }
+
+    #[test]
+    fn cancel_unknown_order_no_panic() {
+        let mut ob = OrderBook::default();
+        let buf = build_order_cancel(999, 100, 1);
+        ob.on_order_cancel(OrderCancel::new(&buf).unwrap());
+    }
+
+    #[test]
+    fn cancel_all_sell_order() {
+        const ID: u64 = 80;
+        const PRICE: u32 = 15000;
+        const SHARES: u32 = 300;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
+        );
+
+        let buf = build_order_cancel(ID, SHARES, 100);
+        ob.on_order_cancel(OrderCancel::new(&buf).unwrap());
+
+        let expected_price = Price::from(PRICE);
+        assert!(!ob.asks.contains_key(&expected_price));
+        assert!(!ob.order_pool.contains_key(&Id(ID)));
+    }
+
+    // ---- on_order_replace ----
+
+    #[test]
+    fn replace_buy_order_new_price_and_shares() {
+        const OLD_ID: u64 = 90;
+        const NEW_ID: u64 = 91;
+        const OLD_PRICE: u32 = 10000;
+        const NEW_PRICE: u32 = 12000;
+        const OLD_SHARES: u32 = 100;
+        const NEW_SHARES: u32 = 250;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(
+                OLD_ID, b'B', OLD_SHARES, OLD_PRICE, 1,
+            ))
+            .unwrap(),
+        );
+
+        let buf = build_order_replace(OLD_ID, NEW_ID, NEW_SHARES, NEW_PRICE, 200);
+        ob.on_order_replace(OrderReplace::new(&buf).unwrap());
+
+        // old price level gone
+        assert!(!ob.bids.contains_key(&Reverse(Price::from(OLD_PRICE))));
+        assert!(!ob.order_pool.contains_key(&Id(OLD_ID)));
+
+        // new order at new price level
+        let new_expected_price = Reverse(Price::from(NEW_PRICE));
+        assert!(ob.bids.contains_key(&new_expected_price));
+        let orders = ob.bids.get(&new_expected_price).unwrap();
+        assert_eq!(orders.len(), 1);
+        assert_eq!(orders[0], Id(NEW_ID));
+        let new_order = ob.order_pool.get(&Id(NEW_ID)).unwrap();
+        assert_eq!(new_order.shares, Quantity(NEW_SHARES));
+        assert_eq!(new_order.side, Side::Buy);
+        assert_eq!(new_order.price, Price::from(NEW_PRICE));
+    }
+
+    #[test]
+    fn replace_sell_order_same_price() {
+        const OLD_ID: u64 = 100;
+        const NEW_ID: u64 = 101;
+        const PRICE: u32 = 15000;
+        const OLD_SHARES: u32 = 100;
+        const NEW_SHARES: u32 = 300;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(OLD_ID, b'S', OLD_SHARES, PRICE, 1))
+                .unwrap(),
+        );
+
+        // add another sell at same price so queue isn't empty after remove
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(102, b'S', 50, PRICE, 2)).unwrap(),
+        );
+
+        let buf = build_order_replace(OLD_ID, NEW_ID, NEW_SHARES, PRICE, 200);
+        ob.on_order_replace(OrderReplace::new(&buf).unwrap());
+
+        let expected_price = Price::from(PRICE);
+        assert!(ob.asks.contains_key(&expected_price));
+        let orders = ob.asks.get(&expected_price).unwrap();
+        assert_eq!(orders.len(), 2);
+        assert_eq!(orders[0], Id(102)); // original second order still first
+        assert_eq!(orders[1], Id(NEW_ID)); // replaced order goes to back of queue
+
+        assert!(!ob.order_pool.contains_key(&Id(OLD_ID)));
+        assert!(ob.order_pool.contains_key(&Id(NEW_ID)));
+    }
+
+    #[test]
+    fn replace_unknown_order_no_panic() {
+        let mut ob = OrderBook::default();
+        let buf = build_order_replace(999, 1000, 100, 10000, 1);
+        ob.on_order_replace(OrderReplace::new(&buf).unwrap());
+    }
+
+    #[test]
+    fn replace_preserves_side() {
+        const OLD_ID: u64 = 110;
+        const NEW_ID: u64 = 111;
+        const PRICE: u32 = 10000;
+
+        let mut ob = OrderBook::default();
+        ob.on_add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(OLD_ID, b'S', 100, PRICE, 1)).unwrap(),
+        );
+
+        let buf = build_order_replace(OLD_ID, NEW_ID, 200, PRICE, 200);
+        ob.on_order_replace(OrderReplace::new(&buf).unwrap());
+
+        assert!(ob.asks.contains_key(&Price::from(PRICE)));
+        let new_order = ob.order_pool.get(&Id(NEW_ID)).unwrap();
+        assert_eq!(new_order.side, Side::Sell);
     }
 }
