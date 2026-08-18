@@ -27,7 +27,7 @@ fn generated_stream_matches_book_state() {
     let book = replay(&feed);
 
     assert_eq!(
-        book.order_pool.len(),
+        book.id_map.len(),
         feed.final_active_orders,
         "generator pool and book pool diverged"
     );
@@ -44,17 +44,22 @@ fn book_queues_are_consistent_after_replay() {
 
     let book = replay(&feed);
 
-    let in_queues: usize = book
-        .bids
-        .values()
-        .map(std::collections::VecDeque::len)
+    let in_queues = count_in_queues(&book);
+    assert_eq!(in_queues, book.id_map.len());
+}
+
+fn count_in_queues(book: &OrderBook) -> usize {
+    book.segments_bids
+        .iter()
+        .filter_map(|seg| seg.as_deref())
+        .map(|seg| seg.iter().map(|level| level.count as usize).sum::<usize>())
         .sum::<usize>()
         + book
-            .asks
-            .values()
-            .map(std::collections::VecDeque::len)
-            .sum::<usize>();
-    assert_eq!(in_queues, book.order_pool.len());
+            .segments_asks
+            .iter()
+            .filter_map(|seg| seg.as_deref())
+            .map(|seg| seg.iter().map(|level| level.count as usize).sum::<usize>())
+            .sum::<usize>()
 }
 
 #[test]
@@ -120,7 +125,7 @@ fn single_type_streams_keep_pool_alive() {
         let book = replay(&feed);
 
         assert_eq!(
-            book.order_pool.len(),
+            book.id_map.len(),
             feed.final_active_orders,
             "{name}: generator pool and book pool diverged"
         );

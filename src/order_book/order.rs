@@ -1,8 +1,11 @@
 use std::ops::SubAssign;
 
-use crate::itch_parser::{
-    add_order::{AddOrderNoMPID, AddOrderWithMPID},
-    modify_order::order_replace::OrderReplace,
+use crate::{
+    itch_parser::{
+        add_order::{AddOrderNoMPID, AddOrderWithMPID},
+        modify_order::order_replace::OrderReplace,
+    },
+    order_book::SlabIndex,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -45,7 +48,7 @@ impl Side {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Order {
     pub id: Id,
     /// scaled integer price
@@ -53,6 +56,8 @@ pub struct Order {
     pub shares: Quantity,
     pub side: Side,
     pub timestamp: Timestamp,
+    pub prev: SlabIndex,
+    pub next: SlabIndex,
 }
 
 impl TryFrom<&AddOrderNoMPID> for Order {
@@ -64,6 +69,8 @@ impl TryFrom<&AddOrderNoMPID> for Order {
             shares: Quantity(value.shares.get()),
             side: Side::from_byte(value.indicator),
             timestamp: Timestamp(value.timestamp.get()),
+            prev: SlabIndex::NULL,
+            next: SlabIndex::NULL,
         })
     }
 }
@@ -77,6 +84,8 @@ impl TryFrom<&AddOrderWithMPID> for Order {
             shares: Quantity(value.shares.get()),
             side: Side::from_byte(value.indicator),
             timestamp: Timestamp(value.timestamp.get()),
+            prev: SlabIndex::NULL,
+            next: SlabIndex::NULL,
         })
     }
 }
@@ -90,6 +99,8 @@ impl TryFrom<&OrderReplace> for Order {
             shares: Quantity(value.shares.get()),
             side: Side::from_byte(b'S'), // dummy value
             timestamp: Timestamp(value.timestamp.get()),
+            prev: SlabIndex::NULL,
+            next: SlabIndex::NULL,
         })
     }
 }

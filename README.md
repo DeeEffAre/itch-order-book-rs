@@ -4,25 +4,28 @@ Basic implementation for a small section of an order book matching engine for NA
 
 ```rust
 pub struct OrderBook {
-    pub bids: BTreeMap<Reverse<order::Price>, VecDeque<order::Id>>,
-    pub asks: BTreeMap<order::Price, VecDeque<order::Id>>,
-    pub order_pool: HashMap<order::Id, order::Order>,
+    pub segments_bids: Vec<Option<Box<[PriceLevel]>>>,
+    pub segments_asks: Vec<Option<Box<[PriceLevel]>>>,
+    pub id_map: FxHashMap<order::Id, SlabIndex>,
+    pub order_pool: Slab,
+    pub best_bid: u64,
+    pub best_ask: u64,
 }
 ```
 
-for the time being buy and sell orders are hold in `OrderBook` within `BTreeMap` and `VecDeque` from Rust's `std::collections`.
+OrderBook utilizes lazy segmented price arrays.
 
 # Benchmark
 
-| Benchmark                      | Messages  | Time (median) | Time per message |
-|--------------------------------|-----------|---------------|------------------|
-| mixed/parse_and_dispatch       | 1,000,000 | 390.1 ms      | 390 ns           |
-| parser/parse_and_dispatch_noop | 1,000,000 | 696.2 µs      | 0.7 ns           |
-| single_type/add                | 200,000   | 97.4 ms       | 487 ns           |
-| single_type/cancel             | 200,000   | 18.9 ms       | 94 ns            |
-| single_type/delete             | 200,000   | 87.0 ms       | 435 ns           |
-| single_type/replace            | 200,000   | 162.3 ms      | 812 ns           |
-| single_type/execute            | 200,000   | 18.9 ms       | 95 ns            |
-| depth/shallow                  | 1,000,000 | 206.2 ms      | 206 ns           |
-| depth/medium                   | 1,000,000 | 382.4 ms      | 382 ns           |
-| depth/deep                     | 1,000,000 | 561.7 ms      | 562 ns           |
+| Bench                            | Messages  | Time (median) | Time per message (ns) | Old results (ns/msg) | Change          |
+|----------------------------------|-----------|---------------|-----------------------|----------------------|-----------------|
+| `mixed/parse_and_dispatch`       | 1,000,000 | 156.58 ms     | **~157**              | ~416                 | **2.6x faster** |
+| `parser/parse_and_dispatch_noop` | 1,000,000 | 711.9 µs      | ~0.7                  | ~0.7                 | same            |
+| `single_type/add`                | 200,000   | 27.80 ms      | ~139                  | ~480                 | **3.5x faster** |
+| `single_type/cancel`             | 200,000   | 36.46 ms      | ~182                  | ~91                  | **2x slower**   |
+| `single_type/delete`             | 200,000   | 35.60 ms      | ~178                  | ~407                 | **2.3x faster** |
+| `single_type/replace`            | 200,000   | 61.53 ms      | ~308                  | ~897                 | **2.9x faster** |
+| `single_type/execute`            | 200,000   | 36.68 ms      | ~183                  | ~109                 | **1.7x slower** |
+| `depth/shallow`                  | 1,000,000 | 143.7 ms      | ~144                  | ~231                 | **1.6x faster** |
+| `depth/medium`                   | 1,000,000 | 166.5 ms      | ~167                  | ~418                 | **2.5x faster** |
+| `depth/deep`                     | 1,000,000 | 182.5 ms      | ~183                  | ~1,439               | **7.9x faster** |

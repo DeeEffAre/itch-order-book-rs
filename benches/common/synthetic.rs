@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 pub const STOCK_LOCATE: u16 = 100;
 pub const STOCK: [u8; 8] = *b"AAPL    ";
-pub const MID_PRICE: u32 = 1_500_000; // $150.00
+pub const MID_PRICE: u32 = 500_000; // $50.00, must stay below order_book::MAX_PRICE
 pub const HALF_BAND: u32 = 30_000; // $3.00
 
 #[allow(dead_code)]

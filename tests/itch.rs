@@ -94,15 +94,20 @@ fn normalized_stream_replays_without_panic() {
         parse_and_dispatch(msg, &mut book);
     }
 
-    let in_queues: usize = book
-        .bids
-        .values()
-        .map(std::collections::VecDeque::len)
+    let in_queues = count_in_queues(&book);
+    assert_eq!(in_queues, book.id_map.len());
+}
+
+fn count_in_queues(book: &OrderBook) -> usize {
+    book.segments_bids
+        .iter()
+        .filter_map(|seg| seg.as_deref())
+        .map(|seg| seg.iter().map(|level| level.count as usize).sum::<usize>())
         .sum::<usize>()
         + book
-            .asks
-            .values()
-            .map(std::collections::VecDeque::len)
-            .sum::<usize>();
-    assert_eq!(in_queues, book.order_pool.len());
+            .segments_asks
+            .iter()
+            .filter_map(|seg| seg.as_deref())
+            .map(|seg| seg.iter().map(|level| level.count as usize).sum::<usize>())
+            .sum::<usize>()
 }
