@@ -53,6 +53,7 @@ pub fn parse_and_dispatch<H: MessageHandler>(raw: &[u8], handler: &mut H) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::order_book::SlabIndex;
 
     fn write_u16_be(buf: &mut [u8], offset: usize, val: u16) {
         buf[offset..offset + 2].copy_from_slice(&val.to_be_bytes());
@@ -179,7 +180,7 @@ mod tests {
     }
 
     impl MessageHandler for AddOrderNoMPIDHandler {
-        fn on_add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) {
+        fn on_add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) -> Option<SlabIndex> {
             self.called = true;
             assert_eq!(msg.message_type, b'A');
             assert_eq!(msg.stock_locate.get(), 100);
@@ -190,6 +191,7 @@ mod tests {
             assert_eq!(msg.shares.get(), 500);
             assert_eq!(msg.stock.get(), u64::from_be_bytes(*b"AAPL    "));
             assert_eq!(msg.price.get(), 15000);
+        None
         }
     }
 
@@ -208,11 +210,12 @@ mod tests {
             buf_len: usize,
         }
         impl MessageHandler for Handler {
-            fn on_add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) {
+            fn on_add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) -> Option<SlabIndex> {
                 assert!(is_zero_copy(
                     unsafe { std::slice::from_raw_parts(self.buf_ptr, self.buf_len) },
                     msg
                 ));
+                None
             }
         }
         let buf = make_add_order_no_mpid();
@@ -244,7 +247,7 @@ mod tests {
     }
 
     impl MessageHandler for AddOrderWithMPIDHandler {
-        fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) {
+        fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) -> Option<SlabIndex> {
             self.called = true;
             assert_eq!(msg.message_type, b'F');
             assert_eq!(msg.stock_locate.get(), 101);
@@ -256,6 +259,7 @@ mod tests {
             assert_eq!(msg.stock.get(), u64::from_be_bytes(*b"GOOGL   "));
             assert_eq!(msg.price.get(), 100_000);
             assert_eq!(msg.attribution.get(), 9999);
+        None
         }
     }
 
@@ -274,11 +278,12 @@ mod tests {
             buf_len: usize,
         }
         impl MessageHandler for Handler {
-            fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) {
+            fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) -> Option<SlabIndex> {
                 assert!(is_zero_copy(
                     unsafe { std::slice::from_raw_parts(self.buf_ptr, self.buf_len) },
                     msg
                 ));
+                None
             }
         }
         let buf = make_add_order_with_mpid();

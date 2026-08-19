@@ -1,26 +1,18 @@
 use std::ops::{Index, IndexMut};
 
-use rustc_hash::FxHashMap;
-
 use crate::itch_parser::{
     add_order::{AddOrderNoMPID, AddOrderWithMPID},
-    handler::MessageHandler,
-    modify_order::{
-        order_cancel::OrderCancel,
-        order_delete::OrderDelete,
-        order_execute::{OrderExecute, OrderExecuteWithPrice},
-        order_replace::OrderReplace,
-    },
+    modify_order::order_replace::OrderReplace,
     system_event_message::SystemEvent,
 };
 
 mod order;
 
-const SEGMENT_SIZE: usize = 1_000_000;
-const MAX_SEGMENTS: usize = 2000;
+const TICK_SIZE: u64 = 100; // 1-cent tick (0.01$ = 100 in 4dp)
+const MAX_PRICE: usize = 100_000; // 100K slots = $1000 range after scaling
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct SlabIndex(u32);
+pub struct SlabIndex(pub u32);
 
 impl SlabIndex {
     pub const NULL: Self = Self(u32::MAX);
@@ -33,19 +25,19 @@ impl SlabIndex {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct Volume(u64);
+pub struct Volume(u32);
 
 impl std::ops::AddAssign<u32> for Volume {
     #[inline]
     fn add_assign(&mut self, rhs: u32) {
-        self.0 += u64::from(rhs);
+        self.0 += rhs;
     }
 }
 
 impl std::ops::SubAssign<u32> for Volume {
     #[inline]
     fn sub_assign(&mut self, rhs: u32) {
-        self.0 -= u64::from(rhs);
+        self.0 -= rhs;
     }
 }
 
@@ -125,6 +117,11 @@ impl Slab {
     }
 
     #[must_use]
+    pub fn len(&self) -> usize {
+        self.orders.len() - self.free_list.len()
+    }
+
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.orders.len() == self.free_list.len()
     }
@@ -135,31 +132,24 @@ impl Slab {
     }
 }
 
-// How does that segment implementation work:
-// Price -> 14,999,500
-// segment_idx = 14,999,500 / 1,000,000 = 14
-// offset = 14,999,500 % 1,000,000 = 999,500
-// if `segment[14]` does not exists then allocate it (24MB)
-// then access `segment[14][994,500]`
-
 pub struct OrderBook {
-    pub segments_bids: Vec<Option<Box<[PriceLevel]>>>,
-    pub segments_asks: Vec<Option<Box<[PriceLevel]>>>,
-    pub id_map: FxHashMap<order::Id, SlabIndex>,
+    pub price_offset: Option<u64>,
+    pub bids: Vec<PriceLevel>,
+    pub asks: Vec<PriceLevel>,
     pub order_pool: Slab,
-    pub best_bid: u64,
-    pub best_ask: u64,
+    pub best_bid: u32,
+    pub best_ask: u32,
 }
 
 impl Default for OrderBook {
     fn default() -> Self {
         Self {
-            segments_bids: Vec::new(),
-            segments_asks: Vec::new(),
-            id_map: FxHashMap::default(),
+            price_offset: None,
+            bids: vec![PriceLevel::default(); MAX_PRICE],
+            asks: vec![PriceLevel::default(); MAX_PRICE],
             order_pool: Slab::default(),
             best_bid: 0,
-            best_ask: u64::MAX,
+            best_ask: u32::MAX,
         }
     }
 }
@@ -167,103 +157,142 @@ impl Default for OrderBook {
 impl OrderBook {
     #[inline]
     #[must_use]
-    pub fn get_order(&self, id: order::Id) -> Option<&order::Order> {
-        self.id_map.get(&id).map(|&idx| &self.order_pool[idx])
-    }
-
-    #[inline]
-    fn get_level(&self, side: order::Side, price: u64) -> Option<&PriceLevel> {
-        let segment_idx = (price / SEGMENT_SIZE as u64) as usize;
-        let offset = (price % SEGMENT_SIZE as u64) as usize;
-
-        let segments = if side == order::Side::Buy {
-            &self.segments_bids
-        } else {
-            &self.segments_asks
-        };
-
-        segments.get(segment_idx)?.as_ref().map(|seg| &seg[offset])
-    }
-
-    #[inline]
-    #[must_use]
     pub fn get_price_level(&self, side: order::Side, price: order::Price) -> Option<&PriceLevel> {
-        self.get_level(side, price.0)
+        let offset = self.price_offset?;
+
+        let tick_price = price.0 / TICK_SIZE;
+
+        if tick_price < offset {
+            return None;
+        }
+
+        let idx = (tick_price - offset) as usize;
+        if idx >= MAX_PRICE {
+            return None;
+        }
+        Some(if side == order::Side::Buy {
+            &self.bids[idx]
+        } else {
+            &self.asks[idx]
+        })
     }
 
-    fn add_order(&mut self, order: order::Order) {
+    fn shift_prices_down(&mut self, shift: u64) {
+        let shift = shift as usize;
+        debug_assert!(shift < MAX_PRICE, "caller rejects shifts >= MAX_PRICE");
+
+        // best_bid == 0 is both the "no bids" sentinel and a valid index (lowest price);
+        // capture occupancy of slot 0 before the shift zeroes it out
+        let has_bid_at_zero = self.bids[0].count > 0;
+
+        // shift bids to right
+        self.bids.copy_within(0..MAX_PRICE - shift, shift);
+        for i in 0..shift {
+            self.bids[i] = PriceLevel::default();
+        }
+
+        // shift asks to right
+        self.asks.copy_within(0..MAX_PRICE - shift, shift);
+        for i in 0..shift {
+            self.asks[i] = PriceLevel::default();
+        }
+
+        // update bests
+        if self.best_bid != 0 || has_bid_at_zero {
+            self.best_bid = self.best_bid.saturating_add(shift as u32);
+        }
+        if self.best_ask != u32::MAX {
+            self.best_ask = self.best_ask.saturating_add(shift as u32);
+        }
+    }
+
+    fn add_order(&mut self, order: order::Order) -> Option<SlabIndex> {
         let price = order.price.0;
-        let side = order.side;
 
-        let new_order_slab_index = self.order_pool.insert(order);
-        self.id_map.insert(order.id, new_order_slab_index);
+        // Tick scaling: 4dp wire value → 1-cent ticks
+        let tick_price = price / TICK_SIZE;
 
-        let segment_idx = (price / SEGMENT_SIZE as u64) as usize;
-        let offset = (price % SEGMENT_SIZE as u64) as usize;
+        // set the offset with first order
+        if self.price_offset.is_none() {
+            self.price_offset = Some(tick_price);
+        }
 
-        assert!(
-            segment_idx < MAX_SEGMENTS,
-            "Price segment exceeds MAX_SEGMENTS"
-        );
+        let offset = self
+            .price_offset
+            .expect("price_offset should be Some when order exists");
 
-        let segments = if side == order::Side::Buy {
-            if price > self.best_bid {
-                self.best_bid = price;
+        if tick_price < offset {
+            let shift = offset - tick_price;
+            if shift >= MAX_PRICE as u64 {
+                // price is far below the window: reject like the high side.
+                // the book must never clear itself, the engine owns the order map
+                return None;
             }
-            &mut self.segments_bids
+            self.shift_prices_down(shift);
+            self.price_offset = Some(tick_price);
+        }
+
+        let offset = self
+            .price_offset
+            .expect("price_offset should be Some when order exists");
+
+        let price_idx = (tick_price - offset) as usize;
+
+        if price_idx >= MAX_PRICE {
+            // reject out of band orders.
+            return None;
+        }
+
+        let slab_idx = self.order_pool.insert(order);
+
+        let level = if order.side == order::Side::Buy {
+            if price_idx as u32 > self.best_bid {
+                self.best_bid = price_idx as u32;
+            }
+            &mut self.bids[price_idx]
         } else {
-            if price < self.best_ask {
-                self.best_ask = price;
+            if (price_idx as u32) < self.best_ask {
+                self.best_ask = price_idx as u32;
             }
-            &mut self.segments_asks
+            &mut self.asks[price_idx]
         };
 
-        if segment_idx >= segments.len() {
-            segments.resize_with(segment_idx + 1, || None);
-        }
-
-        if segments[segment_idx].is_none() {
-            segments[segment_idx] =
-                Some(vec![PriceLevel::default(); SEGMENT_SIZE].into_boxed_slice());
-        }
-
-        let level = &mut segments[segment_idx].as_mut().unwrap()[offset];
-
-        if level.tail.is_null() {
-            level.head = new_order_slab_index;
-            level.tail = new_order_slab_index;
+        if level.tail == SlabIndex::NULL {
+            level.head = slab_idx;
+            level.tail = slab_idx;
         } else {
-            let old_tail_slab_index = level.tail;
-            self.order_pool[old_tail_slab_index].next = new_order_slab_index;
-            self.order_pool[new_order_slab_index].prev = old_tail_slab_index;
-            level.tail = new_order_slab_index;
+            let old_tail = level.tail;
+            self.order_pool[old_tail].next = slab_idx;
+            self.order_pool[slab_idx].prev = old_tail;
+            level.tail = slab_idx;
         }
         level.volume += order.shares.0;
         level.count += 1;
+
+        Some(slab_idx)
     }
 
-    fn remove_order_by_id(&mut self, order_id: order::Id) {
-        let Some(&slab_idx) = self.id_map.get(&order_id) else {
-            return;
-        };
+    fn remove_order_by_slab(&mut self, slab_idx: SlabIndex) {
         let order_copy = self.order_pool[slab_idx];
+        let tick_price = order_copy.price.0 / TICK_SIZE;
 
-        let price = order_copy.price.0;
-        let side = order_copy.side;
+        let offset = self
+            .price_offset
+            .expect("price_offset should be Some when order exists");
 
-        let segment_idx = (price / SEGMENT_SIZE as u64) as usize;
-        let offset = (price % SEGMENT_SIZE as u64) as usize;
+        let price_idx = (tick_price - offset) as usize;
 
-        let segments = if side == order::Side::Buy {
-            &mut self.segments_bids
+        if price_idx >= MAX_PRICE {
+            return;
+        }
+
+        let level = if order_copy.side == order::Side::Buy {
+            &mut self.bids[price_idx]
         } else {
-            &mut self.segments_asks
+            &mut self.asks[price_idx]
         };
-
-        let level = &mut segments[segment_idx].as_mut().unwrap()[offset];
         level.volume -= order_copy.shares.0;
 
-        self.id_map.remove(&order_id);
         self.order_pool.remove(slab_idx);
 
         let prev = order_copy.prev;
@@ -281,70 +310,49 @@ impl OrderBook {
         level.count -= 1;
 
         if level.count == 0 {
-            if side == order::Side::Buy && price == self.best_bid {
-                self.update_best_bid();
-            } else if side == order::Side::Sell && price == self.best_ask {
-                self.update_best_ask();
+            if order_copy.side == order::Side::Buy && price_idx as u32 == self.best_bid {
+                let mut p = self.best_bid;
+                while p > 0 && self.bids[p as usize].count == 0 {
+                    p -= 1;
+                }
+                self.best_bid = if self.bids[p as usize].count > 0 {
+                    p
+                } else {
+                    0
+                };
+            } else if order_copy.side == order::Side::Sell && price_idx as u32 == self.best_ask {
+                let mut p = self.best_ask;
+                while (p as usize) < MAX_PRICE && self.asks[p as usize].count == 0 {
+                    p += 1;
+                }
+                self.best_ask = if (p as usize) < MAX_PRICE && self.asks[p as usize].count > 0 {
+                    p
+                } else {
+                    u32::MAX
+                };
             }
         }
     }
 
-    fn update_best_bid(&mut self) {
-        let mut p = self.best_bid;
-        while p > 0 {
-            p -= 1;
-            if let Some(level) = self.get_level(order::Side::Buy, p)
-                && level.count > 0
-            {
-                self.best_bid = p;
-                return;
-            }
-        }
-        self.best_bid = 0;
-    }
-
-    fn update_best_ask(&mut self) {
-        // no segment exists at or above this price, so the walk is bounded
-        let limit = (self.segments_asks.len() as u64).saturating_mul(SEGMENT_SIZE as u64);
-        let mut p = self.best_ask;
-        while p < limit {
-            p += 1;
-            if let Some(level) = self.get_level(order::Side::Sell, p)
-                && level.count > 0
-            {
-                self.best_ask = p;
-                return;
-            }
-        }
-        self.best_ask = u64::MAX;
-    }
-
-    fn handle_execution(&mut self, order_id: order::Id, executed_shares: u32) {
-        let Some(&slab_idx) = self.id_map.get(&order_id) else {
-            return;
-        };
-
+    fn handle_execution(&mut self, slab_idx: SlabIndex, executed_shares: u32) -> bool {
         let mut order_copy = self.order_pool[slab_idx];
         order_copy.shares -= executed_shares;
         let fully_done = order_copy.shares.0 == 0;
 
-        let price = order_copy.price.0;
-        let side = order_copy.side;
+        let tick_price = order_copy.price.0 / TICK_SIZE;
+        let offset = self
+            .price_offset
+            .expect("price_offset should be Some when order exists");
+        let price_idx = (tick_price - offset) as usize;
 
-        let segment_idx = (price / SEGMENT_SIZE as u64) as usize;
-        let offset = (price % SEGMENT_SIZE as u64) as usize;
-
-        let segments = if side == order::Side::Buy {
-            &mut self.segments_bids
+        let level = if order_copy.side == order::Side::Buy {
+            &mut self.bids[price_idx]
         } else {
-            &mut self.segments_asks
+            &mut self.asks[price_idx]
         };
-
-        let level = &mut segments[segment_idx].as_mut().unwrap()[offset];
         level.volume -= executed_shares;
 
         if fully_done {
-            self.id_map.remove(&order_id);
             self.order_pool.remove(slab_idx);
 
             let prev = order_copy.prev;
@@ -362,14 +370,33 @@ impl OrderBook {
             level.count -= 1;
 
             if level.count == 0 {
-                if side == order::Side::Buy && price == self.best_bid {
-                    self.update_best_bid();
-                } else if side == order::Side::Sell && price == self.best_ask {
-                    self.update_best_ask();
+                if order_copy.side == order::Side::Buy && price_idx as u32 == self.best_bid {
+                    let mut p = self.best_bid;
+                    while p > 0 && self.bids[p as usize].count == 0 {
+                        p -= 1;
+                    }
+                    self.best_bid = if self.bids[p as usize].count > 0 {
+                        p
+                    } else {
+                        0
+                    };
+                } else if order_copy.side == order::Side::Sell && price_idx as u32 == self.best_ask
+                {
+                    let mut p = self.best_ask;
+                    while (p as usize) < MAX_PRICE && self.asks[p as usize].count == 0 {
+                        p += 1;
+                    }
+                    self.best_ask = if (p as usize) < MAX_PRICE && self.asks[p as usize].count > 0 {
+                        p
+                    } else {
+                        u32::MAX
+                    };
                 }
             }
+            true
         } else {
             self.order_pool[slab_idx] = order_copy;
+            false
         }
     }
 
@@ -381,67 +408,60 @@ impl OrderBook {
 
     #[inline]
     fn clear_all(&mut self) {
-        self.segments_bids.clear();
-        self.segments_asks.clear();
-        self.id_map.clear();
+        for level in &mut self.bids {
+            *level = PriceLevel::default();
+        }
+        for level in &mut self.asks {
+            *level = PriceLevel::default();
+        }
+        self.price_offset = None;
         self.order_pool.clear();
         self.best_bid = 0;
-        self.best_ask = u64::MAX;
+        self.best_ask = u32::MAX;
     }
 }
 
-impl MessageHandler for OrderBook {
-    fn on_add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) {
+impl OrderBook {
+    #[inline]
+    pub fn add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) -> Option<SlabIndex> {
         let order = order::Order::try_from(msg).expect("Invalid add order format");
-        self.add_order(order);
+        self.add_order(order)
     }
 
-    fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) {
+    #[inline]
+    pub fn add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) -> Option<SlabIndex> {
         let order = order::Order::try_from(msg).expect("Invalid add order format");
-        self.add_order(order);
+        self.add_order(order)
     }
 
-    fn on_order_execute_with_price(&mut self, msg: &OrderExecuteWithPrice) {
-        self.handle_execution(
-            order::Id(msg.order_ref_number.get()),
-            msg.executed_shares.get(),
-        );
+    /// Removes the order stored at `slab_idx` from its price level and frees the slot.
+    pub fn remove_slab(&mut self, slab_idx: SlabIndex) {
+        self.remove_order_by_slab(slab_idx);
     }
 
-    fn on_order_execute(&mut self, msg: &OrderExecute) {
-        self.handle_execution(
-            order::Id(msg.order_ref_number.get()),
-            msg.executed_shares.get(),
-        );
+    /// Executes/cancels `executed_shares` on the order at `slab_idx`.
+    /// Returns `true` if the order was fully consumed and removed from the book.
+    pub fn handle_execution_slab(&mut self, slab_idx: SlabIndex, executed_shares: u32) -> bool {
+        self.handle_execution(slab_idx, executed_shares)
     }
 
-    fn on_order_delete(&mut self, msg: &OrderDelete) {
-        self.remove_order_by_id(order::Id(msg.order_ref_number.get()));
-    }
-
-    fn on_order_cancel(&mut self, msg: &OrderCancel) {
-        self.handle_execution(
-            order::Id(msg.order_ref_number.get()),
-            msg.cancelled_shares.get(),
-        );
-    }
-
-    fn on_order_replace(&mut self, msg: &OrderReplace) {
-        let old_id = order::Id(msg.org_order_ref_number.get());
-        let Some(&slab_idx) = self.id_map.get(&old_id) else {
-            return;
-        };
-
-        let old_order = *self.order_pool.get(slab_idx);
-        self.remove_order_by_id(old_id);
+    /// Replaces the order at `old_slab_idx` with the new order carried by `msg`.
+    /// Returns the slab index of the replacement, or `None` if it was out of band.
+    pub fn replace_slab(
+        &mut self,
+        old_slab_idx: SlabIndex,
+        msg: &OrderReplace,
+    ) -> Option<SlabIndex> {
+        let old_order = *self.order_pool.get(old_slab_idx);
+        self.remove_order_by_slab(old_slab_idx);
 
         let mut new_order = order::Order::try_from(msg).expect("Invalid replace order format");
         new_order.side = old_order.side;
 
-        self.add_order(new_order);
+        self.add_order(new_order)
     }
 
-    fn on_system_event(&mut self, msg: &SystemEvent) {
+    pub fn on_system_event(&mut self, msg: &SystemEvent) {
         match msg.event_code {
             b'O' | b'S' | b'E' | b'C' if !self.is_empty() => {
                 self.clear_all();
@@ -499,65 +519,9 @@ mod tests {
         buf
     }
 
-    fn build_order_execute(
-        order_ref_number: u64,
-        executed_shares: u32,
-        timestamp: u64,
-    ) -> [u8; 31] {
-        let mut buf = [0u8; 31];
-        buf[0] = b'E';
-        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
-        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
-        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
-        buf[19..23].copy_from_slice(&executed_shares.to_be_bytes());
-        buf[23..31].copy_from_slice(&9999u64.to_be_bytes());
-        buf
-    }
 
-    fn build_order_execute_with_price(
-        order_ref_number: u64,
-        executed_shares: u32,
-        timestamp: u64,
-        execution_price: u32,
-    ) -> [u8; 36] {
-        let mut buf = [0u8; 36];
-        buf[0] = b'C';
-        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
-        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
-        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
-        buf[19..23].copy_from_slice(&executed_shares.to_be_bytes());
-        buf[23..31].copy_from_slice(&8888u64.to_be_bytes());
-        buf[31] = b'Y';
-        buf[32..36].copy_from_slice(&execution_price.to_be_bytes());
-        buf
-    }
 
-    fn build_order_delete(order_ref_number: u64, timestamp: u64) -> [u8; 19] {
-        let mut buf = [0u8; 19];
-        buf[0] = b'D';
-        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
-        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
-        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
-        buf
-    }
 
-    fn build_order_cancel(
-        order_ref_number: u64,
-        cancelled_shares: u32,
-        timestamp: u64,
-    ) -> [u8; 23] {
-        let mut buf = [0u8; 23];
-        buf[0] = b'X';
-        buf[1..3].copy_from_slice(&100u16.to_be_bytes());
-        buf[3..5].copy_from_slice(&200u16.to_be_bytes());
-        buf[5..11].copy_from_slice(&timestamp.to_be_bytes()[2..8]);
-        buf[11..19].copy_from_slice(&order_ref_number.to_be_bytes());
-        buf[19..23].copy_from_slice(&cancelled_shares.to_be_bytes());
-        buf
-    }
 
     fn build_order_replace(
         org_order_ref_number: u64,
@@ -599,6 +563,14 @@ mod tests {
         ids
     }
 
+    fn best_bid_price(book: &OrderBook) -> u64 {
+        (u64::from(book.best_bid) + book.price_offset.unwrap_or(0)) * TICK_SIZE
+    }
+
+    fn best_ask_price(book: &OrderBook) -> u64 {
+        (u64::from(book.best_ask) + book.price_offset.unwrap_or(0)) * TICK_SIZE
+    }
+
     // ---- on_add_order_no_mpid ----
 
     #[test]
@@ -613,17 +585,17 @@ mod tests {
         let buf = build_add_order_no_mpid(ID, SIDE, SHARES, PRICE, TS);
         let msg = AddOrderNoMPID::new(&buf).unwrap();
 
-        ob.on_add_order_no_mpid(msg);
+        let slab = ob.add_order_no_mpid(msg).unwrap();
 
         let level = ob.get_price_level(Side::Buy, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 1);
-        assert_eq!(level.volume.0, u64::from(SHARES));
+        assert_eq!(level.volume.0, SHARES);
         assert_eq!(level_ids(&ob, Side::Buy, PRICE), vec![Id(ID)]);
-        let order = ob.get_order(Id(ID)).unwrap();
+        let order = ob.order_pool.get(slab);
         assert_eq!(order.shares, Quantity(SHARES));
         assert_eq!(order.side, Side::Buy);
         assert_eq!(order.price, Price::from(PRICE));
-        assert_eq!(ob.best_ask, u64::MAX, "no asks should be present");
+        assert_eq!(ob.best_ask, u32::MAX, "no asks should be present");
     }
 
     #[test]
@@ -638,13 +610,13 @@ mod tests {
         let buf = build_add_order_no_mpid(ID, SIDE, SHARES, PRICE, TS);
         let msg = AddOrderNoMPID::new(&buf).unwrap();
 
-        ob.on_add_order_no_mpid(msg);
+        let slab = ob.add_order_no_mpid(msg).unwrap();
 
         let level = ob.get_price_level(Side::Sell, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 1);
-        assert_eq!(level.volume.0, u64::from(SHARES));
+        assert_eq!(level.volume.0, SHARES);
         assert_eq!(level_ids(&ob, Side::Sell, PRICE), vec![Id(ID)]);
-        let order = ob.get_order(Id(ID)).unwrap();
+        let order = ob.order_pool.get(slab);
         assert_eq!(order.shares, Quantity(SHARES));
         assert_eq!(order.side, Side::Sell);
         assert_eq!(order.price, Price::from(PRICE));
@@ -666,12 +638,12 @@ mod tests {
         let buf1 = build_add_order_no_mpid(ID_1, SIDE, SHARES_1, PRICE, TS_1);
         let buf2 = build_add_order_no_mpid(ID_2, SIDE, SHARES_2, PRICE, TS_2);
 
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf1).unwrap());
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf2).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf1).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf2).unwrap());
 
         let level = ob.get_price_level(Side::Buy, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 2);
-        assert_eq!(level.volume.0, u64::from(SHARES_1 + SHARES_2));
+        assert_eq!(level.volume.0, SHARES_1 + SHARES_2);
         assert_eq!(level_ids(&ob, Side::Buy, PRICE), vec![Id(ID_1), Id(ID_2)]);
     }
 
@@ -690,12 +662,12 @@ mod tests {
         let buf1 = build_add_order_no_mpid(ID_1, SIDE, SHARES_1, PRICE, TS_1);
         let buf2 = build_add_order_no_mpid(ID_2, SIDE, SHARES_2, PRICE, TS_2);
 
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf1).unwrap());
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf2).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf1).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf2).unwrap());
 
         let level = ob.get_price_level(Side::Sell, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 2);
-        assert_eq!(level.volume.0, u64::from(SHARES_1 + SHARES_2));
+        assert_eq!(level.volume.0, SHARES_1 + SHARES_2);
         assert_eq!(level_ids(&ob, Side::Sell, PRICE), vec![Id(ID_1), Id(ID_2)]);
     }
 
@@ -715,11 +687,11 @@ mod tests {
         let buf2 = build_add_order_no_mpid(11, SIDE, SHARES, PRICE_HIGH, TS_2);
         let buf3 = build_add_order_no_mpid(12, SIDE, SHARES, PRICE_MID, TS_3);
 
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf1).unwrap());
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf2).unwrap());
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf3).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf1).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf2).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf3).unwrap());
 
-        assert_eq!(ob.best_bid, u64::from(PRICE_HIGH));
+        assert_eq!(best_bid_price(&ob), u64::from(PRICE_HIGH));
         assert_eq!(
             ob.get_price_level(Side::Buy, Price::from(PRICE_LOW))
                 .unwrap()
@@ -756,11 +728,11 @@ mod tests {
         let buf2 = build_add_order_no_mpid(21, SIDE, SHARES, PRICE_LOW, TS_2);
         let buf3 = build_add_order_no_mpid(22, SIDE, SHARES, PRICE_MID, TS_3);
 
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf1).unwrap());
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf2).unwrap());
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf3).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf1).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf2).unwrap());
+        ob.add_order_no_mpid(AddOrderNoMPID::new(&buf3).unwrap());
 
-        assert_eq!(ob.best_ask, u64::from(PRICE_LOW));
+        assert_eq!(best_ask_price(&ob), u64::from(PRICE_LOW));
         assert_eq!(
             ob.get_price_level(Side::Sell, Price::from(PRICE_LOW))
                 .unwrap()
@@ -796,17 +768,17 @@ mod tests {
         let buf = build_add_order_with_mpid(ID, SIDE, SHARES, PRICE, TS, ATTRIBUTION);
         let msg = AddOrderWithMPID::new(&buf).unwrap();
 
-        ob.on_add_order_with_mpid(msg);
+        let slab = ob.add_order_with_mpid(msg).unwrap();
 
         let level = ob.get_price_level(Side::Buy, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 1);
-        assert_eq!(level.volume.0, u64::from(SHARES));
+        assert_eq!(level.volume.0, SHARES);
         assert_eq!(level_ids(&ob, Side::Buy, PRICE), vec![Id(ID)]);
-        let order = ob.get_order(Id(ID)).unwrap();
+        let order = ob.order_pool.get(slab);
         assert_eq!(order.shares, Quantity(SHARES));
         assert_eq!(order.side, Side::Buy);
         assert_eq!(order.price, Price::from(PRICE));
-        assert_eq!(ob.best_ask, u64::MAX, "no asks should be present");
+        assert_eq!(ob.best_ask, u32::MAX, "no asks should be present");
     }
 
     #[test]
@@ -822,13 +794,13 @@ mod tests {
         let buf = build_add_order_with_mpid(ID, SIDE, SHARES, PRICE, TS, ATTRIBUTION);
         let msg = AddOrderWithMPID::new(&buf).unwrap();
 
-        ob.on_add_order_with_mpid(msg);
+        let slab = ob.add_order_with_mpid(msg).unwrap();
 
         let level = ob.get_price_level(Side::Sell, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 1);
-        assert_eq!(level.volume.0, u64::from(SHARES));
+        assert_eq!(level.volume.0, SHARES);
         assert_eq!(level_ids(&ob, Side::Sell, PRICE), vec![Id(ID)]);
-        let order = ob.get_order(Id(ID)).unwrap();
+        let order = ob.order_pool.get(slab);
         assert_eq!(order.shares, Quantity(SHARES));
         assert_eq!(order.side, Side::Sell);
         assert_eq!(order.price, Price::from(PRICE));
@@ -853,8 +825,8 @@ mod tests {
         let buf_sell =
             build_add_order_with_mpid(SELL_ID, b'S', SELL_SHARES, SELL_PRICE, SELL_TS, ATTRIBUTION);
 
-        ob.on_add_order_with_mpid(AddOrderWithMPID::new(&buf_buy).unwrap());
-        ob.on_add_order_with_mpid(AddOrderWithMPID::new(&buf_sell).unwrap());
+        ob.add_order_with_mpid(AddOrderWithMPID::new(&buf_buy).unwrap());
+        ob.add_order_with_mpid(AddOrderWithMPID::new(&buf_sell).unwrap());
 
         assert_eq!(
             ob.get_price_level(Side::Buy, Price::from(BUY_PRICE))
@@ -870,8 +842,8 @@ mod tests {
         );
         assert_eq!(level_ids(&ob, Side::Buy, BUY_PRICE), vec![Id(BUY_ID)]);
         assert_eq!(level_ids(&ob, Side::Sell, SELL_PRICE), vec![Id(SELL_ID)]);
-        assert_eq!(ob.best_bid, u64::from(BUY_PRICE));
-        assert_eq!(ob.best_ask, u64::from(SELL_PRICE));
+        assert_eq!(best_bid_price(&ob), u64::from(BUY_PRICE));
+        assert_eq!(best_ask_price(&ob), u64::from(SELL_PRICE));
     }
 
     #[test]
@@ -879,7 +851,10 @@ mod tests {
         let ob = OrderBook::default();
         assert!(ob.is_empty());
         assert_eq!(ob.best_bid, 0);
-        assert_eq!(ob.best_ask, u64::MAX);
+        assert_eq!(ob.best_ask, u32::MAX);
+        assert!(ob.price_offset.is_none());
+        assert_eq!(ob.bids.len(), MAX_PRICE);
+        assert_eq!(ob.asks.len(), MAX_PRICE);
     }
 
     // ---- on_order_execute ----
@@ -891,22 +866,20 @@ mod tests {
         const SHARES: u32 = 200;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_execute(ID, SHARES, 100);
-        ob.on_order_execute(OrderExecute::new(&buf).unwrap());
+        assert!(ob.handle_execution_slab(slab, SHARES));
 
         let level = ob.get_price_level(Side::Buy, Price::from(PRICE)).unwrap();
         assert_eq!(
             level.count, 0,
             "price level should be empty after last order executed"
         );
-        assert!(
-            ob.get_order(Id(ID)).is_none(),
-            "order should be removed from pool"
-        );
+        assert_eq!(ob.order_pool.len(), 0, "order should be removed from pool");
         assert_eq!(ob.best_bid, 0);
     }
 
@@ -918,19 +891,20 @@ mod tests {
         const EXECUTED: u32 = 80;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
-                .unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                    .unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_execute(ID, EXECUTED, 100);
-        ob.on_order_execute(OrderExecute::new(&buf).unwrap());
+        assert!(!ob.handle_execution_slab(slab, EXECUTED));
 
         let level = ob.get_price_level(Side::Buy, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 1, "queue should still exist");
-        assert_eq!(level.volume.0, u64::from(INITIAL_SHARES - EXECUTED));
+        assert_eq!(level.volume.0, INITIAL_SHARES - EXECUTED);
         assert_eq!(level_ids(&ob, Side::Buy, PRICE), vec![Id(ID)]);
-        let order = ob.get_order(Id(ID)).unwrap();
+        let order = ob.order_pool.get(slab);
         assert_eq!(order.shares, Quantity(INITIAL_SHARES - EXECUTED));
     }
 
@@ -941,15 +915,15 @@ mod tests {
         const INITIAL_SHARES: u32 = 200;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
-                .unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                    .unwrap(),
+            )
+            .unwrap();
 
-        ob.on_order_execute(OrderExecute::new(&build_order_execute(ID, 50, 100)).unwrap());
-        ob.on_order_execute(
-            OrderExecute::new(&build_order_execute(ID, INITIAL_SHARES - 50, 200)).unwrap(),
-        );
+        assert!(!ob.handle_execution_slab(slab, 50));
+        assert!(ob.handle_execution_slab(slab, INITIAL_SHARES - 50));
 
         assert_eq!(
             ob.get_price_level(Side::Buy, Price::from(PRICE))
@@ -957,17 +931,10 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(ID)).is_none());
+        assert_eq!(ob.order_pool.len(), 0);
         assert_eq!(ob.best_bid, 0);
     }
 
-    #[test]
-    fn execute_unknown_order_no_panic() {
-        let mut ob = OrderBook::default();
-        let buf = build_order_execute(999, 100, 1);
-        ob.on_order_execute(OrderExecute::new(&buf).unwrap());
-        // should not panic, nothing happens
-    }
 
     #[test]
     fn execute_full_sell_order() {
@@ -976,12 +943,13 @@ mod tests {
         const SHARES: u32 = 300;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_execute(ID, SHARES, 100);
-        ob.on_order_execute(OrderExecute::new(&buf).unwrap());
+        assert!(ob.handle_execution_slab(slab, SHARES));
 
         assert_eq!(
             ob.get_price_level(Side::Sell, Price::from(PRICE))
@@ -989,8 +957,8 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(ID)).is_none());
-        assert_eq!(ob.best_ask, u64::MAX);
+        assert_eq!(ob.order_pool.len(), 0);
+        assert_eq!(ob.best_ask, u32::MAX);
     }
 
     // ---- on_order_execute_with_price ----
@@ -1002,12 +970,13 @@ mod tests {
         const SHARES: u32 = 100;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_execute_with_price(ID, SHARES, 100, PRICE);
-        ob.on_order_execute_with_price(OrderExecuteWithPrice::new(&buf).unwrap());
+        assert!(ob.handle_execution_slab(slab, SHARES));
 
         assert_eq!(
             ob.get_price_level(Side::Buy, Price::from(PRICE))
@@ -1015,7 +984,7 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(ID)).is_none());
+        assert_eq!(ob.order_pool.len(), 0);
         assert_eq!(ob.best_bid, 0);
     }
 
@@ -1027,28 +996,23 @@ mod tests {
         const EXECUTED: u32 = 75;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
-                .unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                    .unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_execute_with_price(ID, EXECUTED, 100, PRICE);
-        ob.on_order_execute_with_price(OrderExecuteWithPrice::new(&buf).unwrap());
+        assert!(!ob.handle_execution_slab(slab, EXECUTED));
 
         let level = ob.get_price_level(Side::Buy, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 1);
-        assert_eq!(level.volume.0, u64::from(INITIAL_SHARES - EXECUTED));
+        assert_eq!(level.volume.0, INITIAL_SHARES - EXECUTED);
         assert_eq!(level_ids(&ob, Side::Buy, PRICE), vec![Id(ID)]);
-        let order = ob.get_order(Id(ID)).unwrap();
+        let order = ob.order_pool.get(slab);
         assert_eq!(order.shares, Quantity(INITIAL_SHARES - EXECUTED));
     }
 
-    #[test]
-    fn execute_with_price_unknown_order_no_panic() {
-        let mut ob = OrderBook::default();
-        let buf = build_order_execute_with_price(999, 100, 1, 10000);
-        ob.on_order_execute_with_price(OrderExecuteWithPrice::new(&buf).unwrap());
-    }
 
     // ---- on_order_delete ----
 
@@ -1059,12 +1023,13 @@ mod tests {
         const SHARES: u32 = 100;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_delete(ID, 100);
-        ob.on_order_delete(OrderDelete::new(&buf).unwrap());
+        ob.remove_slab(slab);
 
         assert_eq!(
             ob.get_price_level(Side::Buy, Price::from(PRICE))
@@ -1072,7 +1037,7 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(ID)).is_none());
+        assert_eq!(ob.order_pool.len(), 0);
         assert_eq!(ob.best_bid, 0);
     }
 
@@ -1084,29 +1049,26 @@ mod tests {
         const SHARES: u32 = 100;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID_1, b'B', SHARES, PRICE, 1)).unwrap(),
-        );
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID_2, b'B', SHARES, PRICE, 2)).unwrap(),
-        );
+        let slab_1 = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID_1, b'B', SHARES, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
+        let _slab_2 = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID_2, b'B', SHARES, PRICE, 2)).unwrap(),
+            )
+            .unwrap();
 
-        ob.on_order_delete(OrderDelete::new(&build_order_delete(ID_1, 100)).unwrap());
+        ob.remove_slab(slab_1);
 
         let level = ob.get_price_level(Side::Buy, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 1);
         assert_eq!(level_ids(&ob, Side::Buy, PRICE), vec![Id(ID_2)]);
-        assert!(ob.get_order(Id(ID_1)).is_none());
-        assert!(ob.get_order(Id(ID_2)).is_some());
-        assert_eq!(ob.best_bid, u64::from(PRICE));
+        assert_eq!(ob.order_pool.len(), 1);
+        assert_eq!(best_bid_price(&ob), u64::from(PRICE));
     }
 
-    #[test]
-    fn delete_unknown_order_no_panic() {
-        let mut ob = OrderBook::default();
-        let buf = build_order_delete(999, 1);
-        ob.on_order_delete(OrderDelete::new(&buf).unwrap());
-    }
 
     #[test]
     fn delete_existing_sell_order() {
@@ -1115,12 +1077,13 @@ mod tests {
         const SHARES: u32 = 200;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_delete(ID, 100);
-        ob.on_order_delete(OrderDelete::new(&buf).unwrap());
+        ob.remove_slab(slab);
 
         assert_eq!(
             ob.get_price_level(Side::Sell, Price::from(PRICE))
@@ -1128,8 +1091,8 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(ID)).is_none());
-        assert_eq!(ob.best_ask, u64::MAX);
+        assert_eq!(ob.order_pool.len(), 0);
+        assert_eq!(ob.best_ask, u32::MAX);
     }
 
     // ---- on_order_cancel ----
@@ -1141,12 +1104,13 @@ mod tests {
         const SHARES: u32 = 500;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', SHARES, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_cancel(ID, SHARES, 100);
-        ob.on_order_cancel(OrderCancel::new(&buf).unwrap());
+        assert!(ob.handle_execution_slab(slab, SHARES));
 
         assert_eq!(
             ob.get_price_level(Side::Buy, Price::from(PRICE))
@@ -1154,7 +1118,7 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(ID)).is_none());
+        assert_eq!(ob.order_pool.len(), 0);
         assert_eq!(ob.best_bid, 0);
     }
 
@@ -1166,19 +1130,20 @@ mod tests {
         const CANCELLED: u32 = 200;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
-                .unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                    .unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_cancel(ID, CANCELLED, 100);
-        ob.on_order_cancel(OrderCancel::new(&buf).unwrap());
+        assert!(!ob.handle_execution_slab(slab, CANCELLED));
 
         let level = ob.get_price_level(Side::Buy, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 1);
-        assert_eq!(level.volume.0, u64::from(INITIAL_SHARES - CANCELLED));
+        assert_eq!(level.volume.0, INITIAL_SHARES - CANCELLED);
         assert_eq!(level_ids(&ob, Side::Buy, PRICE), vec![Id(ID)]);
-        let order = ob.get_order(Id(ID)).unwrap();
+        let order = ob.order_pool.get(slab);
         assert_eq!(order.shares, Quantity(INITIAL_SHARES - CANCELLED));
     }
 
@@ -1189,15 +1154,15 @@ mod tests {
         const INITIAL_SHARES: u32 = 400;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
-                .unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', INITIAL_SHARES, PRICE, 1))
+                    .unwrap(),
+            )
+            .unwrap();
 
-        ob.on_order_cancel(OrderCancel::new(&build_order_cancel(ID, 150, 100)).unwrap());
-        ob.on_order_cancel(
-            OrderCancel::new(&build_order_cancel(ID, INITIAL_SHARES - 150, 200)).unwrap(),
-        );
+        assert!(!ob.handle_execution_slab(slab, 150));
+        assert!(ob.handle_execution_slab(slab, INITIAL_SHARES - 150));
 
         assert_eq!(
             ob.get_price_level(Side::Buy, Price::from(PRICE))
@@ -1205,16 +1170,10 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(ID)).is_none());
+        assert_eq!(ob.order_pool.len(), 0);
         assert_eq!(ob.best_bid, 0);
     }
 
-    #[test]
-    fn cancel_unknown_order_no_panic() {
-        let mut ob = OrderBook::default();
-        let buf = build_order_cancel(999, 100, 1);
-        ob.on_order_cancel(OrderCancel::new(&buf).unwrap());
-    }
 
     #[test]
     fn cancel_all_sell_order() {
@@ -1223,12 +1182,13 @@ mod tests {
         const SHARES: u32 = 300;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
-        );
+        let slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'S', SHARES, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
 
-        let buf = build_order_cancel(ID, SHARES, 100);
-        ob.on_order_cancel(OrderCancel::new(&buf).unwrap());
+        assert!(ob.handle_execution_slab(slab, SHARES));
 
         assert_eq!(
             ob.get_price_level(Side::Sell, Price::from(PRICE))
@@ -1236,8 +1196,8 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(ID)).is_none());
-        assert_eq!(ob.best_ask, u64::MAX);
+        assert_eq!(ob.order_pool.len(), 0);
+        assert_eq!(ob.best_ask, u32::MAX);
     }
 
     // ---- on_order_replace ----
@@ -1252,15 +1212,17 @@ mod tests {
         const NEW_SHARES: u32 = 250;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(
-                OLD_ID, b'B', OLD_SHARES, OLD_PRICE, 1,
-            ))
-            .unwrap(),
-        );
+        let old_slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(
+                    OLD_ID, b'B', OLD_SHARES, OLD_PRICE, 1,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
 
         let buf = build_order_replace(OLD_ID, NEW_ID, NEW_SHARES, NEW_PRICE, 200);
-        ob.on_order_replace(OrderReplace::new(&buf).unwrap());
+        let new_slab = ob.replace_slab(old_slab, OrderReplace::new(&buf).unwrap()).unwrap();
 
         // old price level gone
         assert_eq!(
@@ -1269,7 +1231,7 @@ mod tests {
                 .count,
             0
         );
-        assert!(ob.get_order(Id(OLD_ID)).is_none());
+        assert_eq!(ob.order_pool.len(), 1);
 
         // new order at new price level
         let level = ob
@@ -1277,11 +1239,11 @@ mod tests {
             .unwrap();
         assert_eq!(level.count, 1);
         assert_eq!(level_ids(&ob, Side::Buy, NEW_PRICE), vec![Id(NEW_ID)]);
-        let new_order = ob.get_order(Id(NEW_ID)).unwrap();
+        let new_order = ob.order_pool.get(new_slab);
         assert_eq!(new_order.shares, Quantity(NEW_SHARES));
         assert_eq!(new_order.side, Side::Buy);
         assert_eq!(new_order.price, Price::from(NEW_PRICE));
-        assert_eq!(ob.best_bid, u64::from(NEW_PRICE));
+        assert_eq!(best_bid_price(&ob), u64::from(NEW_PRICE));
     }
 
     #[test]
@@ -1293,33 +1255,28 @@ mod tests {
         const NEW_SHARES: u32 = 300;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(OLD_ID, b'S', OLD_SHARES, PRICE, 1))
-                .unwrap(),
-        );
+        let old_slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(OLD_ID, b'S', OLD_SHARES, PRICE, 1))
+                    .unwrap(),
+            )
+            .unwrap();
 
         // add another sell at same price so queue isn't empty after remove
-        ob.on_add_order_no_mpid(
+        ob.add_order_no_mpid(
             AddOrderNoMPID::new(&build_add_order_no_mpid(102, b'S', 50, PRICE, 2)).unwrap(),
         );
 
         let buf = build_order_replace(OLD_ID, NEW_ID, NEW_SHARES, PRICE, 200);
-        ob.on_order_replace(OrderReplace::new(&buf).unwrap());
+        let _new_slab = ob.replace_slab(old_slab, OrderReplace::new(&buf).unwrap()).unwrap();
 
         let level = ob.get_price_level(Side::Sell, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 2);
         assert_eq!(level_ids(&ob, Side::Sell, PRICE), vec![Id(102), Id(NEW_ID)]);
 
-        assert!(ob.get_order(Id(OLD_ID)).is_none());
-        assert!(ob.get_order(Id(NEW_ID)).is_some());
+        assert_eq!(ob.order_pool.len(), 2);
     }
 
-    #[test]
-    fn replace_unknown_order_no_panic() {
-        let mut ob = OrderBook::default();
-        let buf = build_order_replace(999, 1000, 100, 10000, 1);
-        ob.on_order_replace(OrderReplace::new(&buf).unwrap());
-    }
 
     #[test]
     fn replace_preserves_side() {
@@ -1328,12 +1285,14 @@ mod tests {
         const PRICE: u32 = 10000;
 
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(OLD_ID, b'S', 100, PRICE, 1)).unwrap(),
-        );
+        let old_slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(OLD_ID, b'S', 100, PRICE, 1)).unwrap(),
+            )
+            .unwrap();
 
         let buf = build_order_replace(OLD_ID, NEW_ID, 200, PRICE, 200);
-        ob.on_order_replace(OrderReplace::new(&buf).unwrap());
+        let new_slab = ob.replace_slab(old_slab, OrderReplace::new(&buf).unwrap()).unwrap();
 
         assert_eq!(
             ob.get_price_level(Side::Sell, Price::from(PRICE))
@@ -1341,7 +1300,7 @@ mod tests {
                 .count,
             1
         );
-        let new_order = ob.get_order(Id(NEW_ID)).unwrap();
+        let new_order = ob.order_pool.get(new_slab);
         assert_eq!(new_order.side, Side::Sell);
     }
 
@@ -1350,10 +1309,10 @@ mod tests {
     #[test]
     fn system_event_clears_non_empty_book() {
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
+        ob.add_order_no_mpid(
             AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
         );
-        ob.on_add_order_no_mpid(
+        ob.add_order_no_mpid(
             AddOrderNoMPID::new(&build_add_order_no_mpid(2, b'S', 50, 12000, 2)).unwrap(),
         );
         assert!(!ob.is_empty());
@@ -1362,15 +1321,14 @@ mod tests {
         ob.on_system_event(SystemEvent::new(&buf).unwrap());
 
         assert!(ob.is_empty());
-        assert!(ob.id_map.is_empty());
         assert_eq!(ob.best_bid, 0);
-        assert_eq!(ob.best_ask, u64::MAX);
+        assert_eq!(ob.best_ask, u32::MAX);
     }
 
     #[test]
     fn system_event_start_of_system_hours_clears() {
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
+        ob.add_order_no_mpid(
             AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
         );
 
@@ -1383,7 +1341,7 @@ mod tests {
     #[test]
     fn system_event_end_of_system_hours_clears() {
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
+        ob.add_order_no_mpid(
             AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
         );
 
@@ -1396,7 +1354,7 @@ mod tests {
     #[test]
     fn system_event_end_of_messages_clears() {
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
+        ob.add_order_no_mpid(
             AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
         );
 
@@ -1420,7 +1378,7 @@ mod tests {
     #[test]
     fn system_event_market_hours_does_not_clear() {
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
+        ob.add_order_no_mpid(
             AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
         );
 
@@ -1439,7 +1397,7 @@ mod tests {
     #[test]
     fn system_event_end_of_market_hours_does_not_clear() {
         let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
+        ob.add_order_no_mpid(
             AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 100, 10000, 1)).unwrap(),
         );
 
@@ -1449,81 +1407,80 @@ mod tests {
         assert!(!ob.is_empty());
     }
 
-    // ---- segmented price mapping ----
+    // ---- price offset sliding ----
 
     #[test]
-    fn lazy_segment_allocation_only_touches_used_segments() {
-        const ID: u64 = 1;
-        const PRICE: u32 = 14_999_500; // segment 14, offset 999_500
+    fn lower_price_shifts_offset_down() {
+        const HIGH_ID: u64 = 1;
+        const LOW_ID: u64 = 2;
+        const HIGH_PRICE: u32 = 20_000;
+        const LOW_PRICE: u32 = 10_000;
 
         let mut ob = OrderBook::default();
-        assert!(ob.segments_bids.is_empty());
-        assert!(ob.segments_asks.is_empty());
+        let high_slab = ob
+            .add_order_no_mpid(
+                AddOrderNoMPID::new(&build_add_order_no_mpid(HIGH_ID, b'B', 100, HIGH_PRICE, 1))
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(ob.price_offset, Some(u64::from(HIGH_PRICE) / TICK_SIZE));
+        assert_eq!(ob.best_bid, 0);
 
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(ID, b'B', 100, PRICE, 1)).unwrap(),
+        // lower price arrives -> offset slides down, existing level shifts right
+        ob.add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(LOW_ID, b'B', 100, LOW_PRICE, 2)).unwrap(),
+        );
+        assert_eq!(ob.price_offset, Some(u64::from(LOW_PRICE) / TICK_SIZE));
+        assert_eq!(best_bid_price(&ob), u64::from(HIGH_PRICE));
+
+        // both levels intact after the shift
+        assert_eq!(
+            ob.get_price_level(Side::Buy, Price::from(HIGH_PRICE))
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(
+            ob.get_price_level(Side::Buy, Price::from(LOW_PRICE))
+                .unwrap()
+                .count,
+            1
+        );
+        assert_eq!(level_ids(&ob, Side::Buy, HIGH_PRICE), vec![Id(HIGH_ID)]);
+        assert_eq!(level_ids(&ob, Side::Buy, LOW_PRICE), vec![Id(LOW_ID)]);
+
+        // removal still works after the shift
+        ob.remove_slab(high_slab);
+        assert_eq!(best_bid_price(&ob), u64::from(LOW_PRICE));
+        assert_eq!(ob.order_pool.len(), 1);
+    }
+
+    #[test]
+    fn out_of_band_order_is_rejected() {
+        const IN_BAND_ID: u64 = 1;
+        const OUT_OF_BAND_ID: u64 = 2;
+        const BASE_PRICE: u32 = 10_000; // tick 100
+        const OUT_OF_BAND_PRICE: u32 = 10_010_000; // tick 100_100 -> idx 100_000 == MAX_PRICE
+
+        let mut ob = OrderBook::default();
+        ob.add_order_no_mpid(
+            AddOrderNoMPID::new(&build_add_order_no_mpid(
+                IN_BAND_ID, b'B', 100, BASE_PRICE, 1,
+            ))
+            .unwrap(),
         );
 
-        assert_eq!(ob.segments_bids.len(), 15);
+        // out-of-band add is silently dropped, no panic
+        let buf = build_add_order_no_mpid(OUT_OF_BAND_ID, b'B', 100, OUT_OF_BAND_PRICE, 2);
+        let rejected = ob.add_order_no_mpid(AddOrderNoMPID::new(&buf).unwrap());
+
+        assert!(rejected.is_none());
+        assert_eq!(ob.order_pool.len(), 1);
         assert!(
-            ob.segments_bids[..14]
-                .iter()
-                .all(std::option::Option::is_none)
+            ob.get_price_level(Side::Buy, Price::from(OUT_OF_BAND_PRICE))
+                .is_none()
         );
-        assert!(ob.segments_bids[14].is_some());
-        assert!(ob.segments_asks.is_empty());
-
-        let level = ob.segments_bids[14].as_ref().unwrap()[999_500];
-        assert_eq!(level.count, 1);
-        assert_eq!(ob.best_bid, u64::from(PRICE));
-    }
-
-    #[test]
-    fn prices_across_segment_boundaries() {
-        let mut ob = OrderBook::default();
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(1, b'B', 10, 999_999, 1)).unwrap(),
-        );
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(2, b'B', 10, 1_000_000, 2)).unwrap(),
-        );
-        ob.on_add_order_no_mpid(
-            AddOrderNoMPID::new(&build_add_order_no_mpid(3, b'B', 10, 1_500_000, 3)).unwrap(),
-        );
-
-        assert_eq!(
-            ob.get_price_level(Side::Buy, Price::from(999_999))
-                .unwrap()
-                .count,
-            1
-        );
-        assert_eq!(
-            ob.get_price_level(Side::Buy, Price::from(1_000_000))
-                .unwrap()
-                .count,
-            1
-        );
-        assert_eq!(
-            ob.get_price_level(Side::Buy, Price::from(1_500_000))
-                .unwrap()
-                .count,
-            1
-        );
-        assert_eq!(ob.best_bid, 1_500_000);
-
-        // removing the best bid walks down across the segment boundary
-        ob.on_order_delete(OrderDelete::new(&build_order_delete(3, 100)).unwrap());
-        assert_eq!(ob.best_bid, 1_000_000);
-    }
-
-    #[test]
-    #[should_panic(expected = "Price segment exceeds MAX_SEGMENTS")]
-    fn add_order_beyond_max_segments_panics() {
-        const ID: u64 = 1;
-        const PRICE: u32 = 2_000_000_000; // segment 2000 = MAX_SEGMENTS
-
-        let mut ob = OrderBook::default();
-        let buf = build_add_order_no_mpid(ID, b'B', 100, PRICE, 1);
-        ob.on_add_order_no_mpid(AddOrderNoMPID::new(&buf).unwrap());
+        assert_eq!(level_ids(&ob, Side::Buy, BASE_PRICE), vec![Id(IN_BAND_ID)]);
+        assert_eq!(ob.best_bid, 0);
     }
 }

@@ -27,6 +27,25 @@ pub fn count_messages(buf: &[u8]) -> usize {
     Splitter::new(buf).count()
 }
 
+/// Returns the distinct `stock_locate` values in the buffer, in first-seen order.
+/// Only counts message types the engine dispatches (A/F/C/E/D/X/U/S) so the
+/// number of books matches what the replay would create.
+#[allow(dead_code)]
+pub fn distinct_locates(buf: &[u8]) -> Vec<usize> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for msg in Splitter::new(buf) {
+        if !matches!(msg[0], b'A' | b'F' | b'C' | b'E' | b'D' | b'X' | b'U' | b'S') {
+            continue;
+        }
+        let locate = u16::from_be_bytes([msg[1], msg[2]]) as usize;
+        if seen.insert(locate) {
+            out.push(locate);
+        }
+    }
+    out
+}
+
 pub struct Splitter<'a> {
     buf: &'a [u8],
     pos: usize,

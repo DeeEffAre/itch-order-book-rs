@@ -1,8 +1,8 @@
 mod common;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use order_book_matching_engine::engine::Engine;
 use order_book_matching_engine::itch_parser::{handler::MessageHandler, parse_and_dispatch};
-use order_book_matching_engine::order_book::OrderBook;
 use std::hint::black_box;
 
 use common::synthetic::{self, SyntheticConfig, Weights};
@@ -24,17 +24,17 @@ fn bench_mixed_stream(c: &mut Criterion, id: &str, cfg: &SyntheticConfig) {
     c.bench_function(id, |b| {
         b.iter_batched(
             || {
-                let mut book = OrderBook::default();
+                let mut engine = Engine::default();
                 for m in &feed.prefill {
-                    parse_and_dispatch(m, &mut book);
+                    parse_and_dispatch(m, &mut engine);
                 }
-                book
+                engine
             },
-            |mut book| {
+            |mut engine| {
                 for m in &feed.messages {
-                    parse_and_dispatch(black_box(m), &mut book);
+                    parse_and_dispatch(black_box(m), &mut engine);
                 }
-                black_box(book)
+                black_box(engine)
             },
             BatchSize::SmallInput,
         );

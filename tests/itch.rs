@@ -4,8 +4,8 @@ mod itch;
 #[path = "../benches/common/synthetic.rs"]
 mod synthetic;
 
+use order_book_matching_engine::engine::Engine;
 use order_book_matching_engine::itch_parser::parse_and_dispatch;
-use order_book_matching_engine::order_book::OrderBook;
 
 fn length_prefix(messages: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
@@ -89,25 +89,39 @@ fn normalized_stream_replays_without_panic() {
     buf.extend(length_prefix(&feed.messages));
     itch::normalize_locate(&mut buf, 7);
 
-    let mut book = OrderBook::default();
+    let mut engine = Engine::default();
     for msg in itch::Splitter::new(&buf) {
-        parse_and_dispatch(msg, &mut book);
+        parse_and_dispatch(msg, &mut engine);
     }
 
-    let in_queues = count_in_queues(&book);
-    assert_eq!(in_queues, book.id_map.len());
+    let in_queues = count_in_queues(&engine);
+    assert_eq!(in_queues, total_active_orders(&engine));
 }
 
-fn count_in_queues(book: &OrderBook) -> usize {
-    book.segments_bids
+fn count_in_queues(engine: &Engine) -> usize {
+    engine
+        .books
         .iter()
-        .filter_map(|seg| seg.as_deref())
-        .map(|seg| seg.iter().map(|level| level.count as usize).sum::<usize>())
-        .sum::<usize>()
-        + book
-            .segments_asks
-            .iter()
-            .filter_map(|seg| seg.as_deref())
-            .map(|seg| seg.iter().map(|level| level.count as usize).sum::<usize>())
-            .sum::<usize>()
+        .flatten()
+        .map(|book| {
+            book.bids
+                .iter()
+                .map(|level| level.count as usize)
+                .sum::<usize>()
+                + book
+                    .asks
+                    .iter()
+                    .map(|level| level.count as usize)
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn total_active_orders(engine: &Engine) -> usize {
+    engine
+        .books
+        .iter()
+        .flatten()
+        .map(|book| book.order_pool.len())
+        .sum()
 }

@@ -1,18 +1,18 @@
 #[path = "../benches/common/synthetic.rs"]
 mod synthetic;
 
+use order_book_matching_engine::engine::Engine;
 use order_book_matching_engine::itch_parser::parse_and_dispatch;
-use order_book_matching_engine::order_book::OrderBook;
 
-fn replay(feed: &synthetic::Feed) -> OrderBook {
-    let mut book = OrderBook::default();
+fn replay(feed: &synthetic::Feed) -> Engine {
+    let mut engine = Engine::default();
     for m in &feed.prefill {
-        parse_and_dispatch(m, &mut book);
+        parse_and_dispatch(m, &mut engine);
     }
     for m in &feed.messages {
-        parse_and_dispatch(m, &mut book);
+        parse_and_dispatch(m, &mut engine);
     }
-    book
+    engine
 }
 
 #[test]
@@ -24,10 +24,10 @@ fn generated_stream_matches_book_state() {
     };
     let feed = synthetic::generate(&cfg);
 
-    let book = replay(&feed);
+    let engine = replay(&feed);
 
     assert_eq!(
-        book.id_map.len(),
+        total_active_orders(&engine),
         feed.final_active_orders,
         "generator pool and book pool diverged"
     );
@@ -42,24 +42,38 @@ fn book_queues_are_consistent_after_replay() {
     };
     let feed = synthetic::generate(&cfg);
 
-    let book = replay(&feed);
+    let engine = replay(&feed);
 
-    let in_queues = count_in_queues(&book);
-    assert_eq!(in_queues, book.id_map.len());
+    let in_queues = count_in_queues(&engine);
+    assert_eq!(in_queues, total_active_orders(&engine));
 }
 
-fn count_in_queues(book: &OrderBook) -> usize {
-    book.segments_bids
+fn count_in_queues(engine: &Engine) -> usize {
+    engine
+        .books
         .iter()
-        .filter_map(|seg| seg.as_deref())
-        .map(|seg| seg.iter().map(|level| level.count as usize).sum::<usize>())
-        .sum::<usize>()
-        + book
-            .segments_asks
-            .iter()
-            .filter_map(|seg| seg.as_deref())
-            .map(|seg| seg.iter().map(|level| level.count as usize).sum::<usize>())
-            .sum::<usize>()
+        .flatten()
+        .map(|book| {
+            book.bids
+                .iter()
+                .map(|level| level.count as usize)
+                .sum::<usize>()
+                + book
+                    .asks
+                    .iter()
+                    .map(|level| level.count as usize)
+                    .sum::<usize>()
+        })
+        .sum()
+}
+
+fn total_active_orders(engine: &Engine) -> usize {
+    engine
+        .books
+        .iter()
+        .flatten()
+        .map(|book| book.order_pool.len())
+        .sum()
 }
 
 #[test]
@@ -122,10 +136,10 @@ fn single_type_streams_keep_pool_alive() {
         };
         let feed = synthetic::generate(&cfg);
 
-        let book = replay(&feed);
+        let engine = replay(&feed);
 
         assert_eq!(
-            book.id_map.len(),
+            total_active_orders(&engine),
             feed.final_active_orders,
             "{name}: generator pool and book pool diverged"
         );
@@ -148,4 +162,63 @@ fn message_len_table_is_exhaustive_for_generated_types() {
             msg.len()
         );
     }
+}
+
+#[test]
+fn engine_tracks_order_locations_in_global_map() {
+    use order_book_matching_engine::order_book::SlabIndex;
+
+    let mut engine = Engine::default();
+
+    let mut add = [0u8; 36];
+    add[0] = b'A';
+    add[1..3].copy_from_slice(&100u16.to_be_bytes());
+    add[11..19].copy_from_slice(&5u64.to_be_bytes());
+    add[19] = b'B';
+    add[20..24].copy_from_slice(&100u32.to_be_bytes());
+    add[24..32].copy_from_slice(b"AAPL    ");
+    add[32..36].copy_from_slice(&500_000u32.to_be_bytes());
+    parse_and_dispatch(&add, &mut engine);
+
+    let info = engine.global_map.map[5];
+    assert_eq!(info.locate, 100);
+    assert!(!info.slab_idx.is_null());
+    assert_eq!(total_active_orders(&engine), 1);
+
+    // delete the order -> map entry cleared
+    let mut del = [0u8; 19];
+    del[0] = b'D';
+    del[1..3].copy_from_slice(&100u16.to_be_bytes());
+    del[11..19].copy_from_slice(&5u64.to_be_bytes());
+    parse_and_dispatch(&del, &mut engine);
+
+    assert!(engine.global_map.map[5].slab_idx == SlabIndex::NULL);
+    assert_eq!(total_active_orders(&engine), 0);
+}
+
+#[test]
+fn unknown_order_messages_are_ignored() {
+    let mut engine = Engine::default();
+
+    let mut del = [0u8; 19];
+    del[0] = b'D';
+    del[1..3].copy_from_slice(&100u16.to_be_bytes());
+    del[11..19].copy_from_slice(&999_999_999u64.to_be_bytes());
+    parse_and_dispatch(&del, &mut engine);
+
+    let mut cancel = [0u8; 23];
+    cancel[0] = b'X';
+    cancel[1..3].copy_from_slice(&100u16.to_be_bytes());
+    cancel[11..19].copy_from_slice(&999_999_999u64.to_be_bytes());
+    parse_and_dispatch(&cancel, &mut engine);
+
+    let mut exe = [0u8; 31];
+    exe[0] = b'E';
+    exe[1..3].copy_from_slice(&100u16.to_be_bytes());
+    exe[11..19].copy_from_slice(&999_999_999u64.to_be_bytes());
+    parse_and_dispatch(&exe, &mut engine);
+
+    // no books created, no map entries
+    assert_eq!(total_active_orders(&engine), 0);
+    assert!(engine.global_map.map.is_empty());
 }

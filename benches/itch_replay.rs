@@ -1,8 +1,8 @@
 mod common;
 
 use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use order_book_matching_engine::engine::Engine;
 use order_book_matching_engine::itch_parser::{handler::MessageHandler, parse_and_dispatch};
-use order_book_matching_engine::order_book::OrderBook;
 use std::hint::black_box;
 
 use common::itch::{self, Splitter};
@@ -19,18 +19,29 @@ impl MessageHandler for NoopHandler {}
 fn bench_replay(c: &mut Criterion) {
     let path = std::env::var("ITCH_FILE").unwrap_or_else(|_| default_path());
     let mut data = itch::load(&path);
-    itch::normalize_locate(&mut data, 1);
     let msg_count = itch::count_messages(&data);
-    eprintln!("loaded {path}: {} bytes, {msg_count} messages", data.len());
+    let locates = itch::distinct_locates(&data);
+    eprintln!(
+        "loaded {path}: {} bytes, {msg_count} messages, {} locates",
+        data.len(),
+        locates.len()
+    );
 
     c.bench_function("replay/book_full_stream", |b| {
         b.iter_batched(
-            OrderBook::default,
-            |mut book| {
-                for msg in Splitter::new(&data) {
-                    parse_and_dispatch(black_box(msg), &mut book);
+            || {
+                // pre-create one book per locate so first-touch allocation stays untimed
+                let mut engine = Engine::default();
+                for &locate in &locates {
+                    engine.inline_get_book(locate);
                 }
-                black_box(book)
+                engine
+            },
+            |mut engine| {
+                for msg in Splitter::new(&data) {
+                    parse_and_dispatch(black_box(msg), &mut engine);
+                }
+                black_box(engine)
             },
             BatchSize::SmallInput,
         );
