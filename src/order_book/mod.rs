@@ -455,7 +455,7 @@ impl MessageHandler for OrderBook {
 mod tests {
     use super::*;
     use crate::itch_parser::Message;
-    use crate::order_book::order::{Id, Price, Quantity, Side, Timestamp};
+    use crate::order_book::order::{Id, Price, Quantity, Side};
 
     fn build_add_order_no_mpid(
         order_ref_number: u64,
@@ -623,7 +623,6 @@ mod tests {
         assert_eq!(order.shares, Quantity(SHARES));
         assert_eq!(order.side, Side::Buy);
         assert_eq!(order.price, Price::from(PRICE));
-        assert_eq!(order.timestamp, Timestamp(TS));
         assert_eq!(ob.best_ask, u64::MAX, "no asks should be present");
     }
 
@@ -649,7 +648,6 @@ mod tests {
         assert_eq!(order.shares, Quantity(SHARES));
         assert_eq!(order.side, Side::Sell);
         assert_eq!(order.price, Price::from(PRICE));
-        assert_eq!(order.timestamp, Timestamp(TS));
         assert_eq!(ob.best_bid, 0, "no bids should be present");
     }
 
@@ -808,7 +806,6 @@ mod tests {
         assert_eq!(order.shares, Quantity(SHARES));
         assert_eq!(order.side, Side::Buy);
         assert_eq!(order.price, Price::from(PRICE));
-        assert_eq!(order.timestamp, Timestamp(TS));
         assert_eq!(ob.best_ask, u64::MAX, "no asks should be present");
     }
 
@@ -835,7 +832,6 @@ mod tests {
         assert_eq!(order.shares, Quantity(SHARES));
         assert_eq!(order.side, Side::Sell);
         assert_eq!(order.price, Price::from(PRICE));
-        assert_eq!(order.timestamp, Timestamp(TS));
         assert_eq!(ob.best_bid, 0, "no bids should be present");
     }
 

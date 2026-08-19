@@ -35,9 +35,6 @@ pub enum Side {
     Sell,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Timestamp(pub u64);
-
 impl Side {
     fn from_byte(raw_byte: u8) -> Self {
         match raw_byte {
@@ -55,7 +52,6 @@ pub struct Order {
     pub price: Price,
     pub shares: Quantity,
     pub side: Side,
-    pub timestamp: Timestamp,
     pub prev: SlabIndex,
     pub next: SlabIndex,
 }
@@ -68,7 +64,6 @@ impl TryFrom<&AddOrderNoMPID> for Order {
             price: Price::from(value.price.get()),
             shares: Quantity(value.shares.get()),
             side: Side::from_byte(value.indicator),
-            timestamp: Timestamp(value.timestamp.get()),
             prev: SlabIndex::NULL,
             next: SlabIndex::NULL,
         })
@@ -83,7 +78,6 @@ impl TryFrom<&AddOrderWithMPID> for Order {
             price: Price::from(value.price.get()),
             shares: Quantity(value.shares.get()),
             side: Side::from_byte(value.indicator),
-            timestamp: Timestamp(value.timestamp.get()),
             prev: SlabIndex::NULL,
             next: SlabIndex::NULL,
         })
@@ -98,7 +92,6 @@ impl TryFrom<&OrderReplace> for Order {
             price: Price::from(value.price.get()),
             shares: Quantity(value.shares.get()),
             side: Side::from_byte(b'S'), // dummy value
-            timestamp: Timestamp(value.timestamp.get()),
             prev: SlabIndex::NULL,
             next: SlabIndex::NULL,
         })
