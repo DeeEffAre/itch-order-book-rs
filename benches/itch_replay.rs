@@ -18,7 +18,7 @@ impl MessageHandler for NoopHandler {}
 
 fn bench_replay(c: &mut Criterion) {
     let path = std::env::var("ITCH_FILE").unwrap_or_else(|_| default_path());
-    let mut data = itch::load(&path);
+    let data = itch::load(&path);
     let msg_count = itch::count_messages(&data);
     let locates = itch::distinct_locates(&data);
     eprintln!(
@@ -43,7 +43,7 @@ fn bench_replay(c: &mut Criterion) {
                 }
                 black_box(engine)
             },
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
 

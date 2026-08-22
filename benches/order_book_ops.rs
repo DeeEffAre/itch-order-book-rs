@@ -17,19 +17,19 @@ const ZERO_WEIGHTS: Weights = Weights {
     execute_with_price: 0,
 };
 
-/// Replays the feed's prefill into a fresh book (setup, not timed), then times
-/// the replay of the measured message stream against that deep book.
+/// Builds the feed and warms the books once (outside measurement), then times
+/// the replay of the measured message stream against clones of the template.
 fn bench_mixed_stream(c: &mut Criterion, id: &str, cfg: &SyntheticConfig) {
     let feed = synthetic::generate(cfg);
+
+    let mut template = Engine::default();
+    for m in &feed.prefill {
+        parse_and_dispatch(m, &mut template);
+    }
+
     c.bench_function(id, |b| {
         b.iter_batched(
-            || {
-                let mut engine = Engine::default();
-                for m in &feed.prefill {
-                    parse_and_dispatch(m, &mut engine);
-                }
-                engine
-            },
+            || template.clone(),
             |mut engine| {
                 for m in &feed.messages {
                     parse_and_dispatch(black_box(m), &mut engine);

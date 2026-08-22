@@ -191,7 +191,7 @@ mod tests {
             assert_eq!(msg.shares.get(), 500);
             assert_eq!(msg.stock.get(), u64::from_be_bytes(*b"AAPL    "));
             assert_eq!(msg.price.get(), 15000);
-        None
+            None
         }
     }
 
@@ -259,7 +259,7 @@ mod tests {
             assert_eq!(msg.stock.get(), u64::from_be_bytes(*b"GOOGL   "));
             assert_eq!(msg.price.get(), 100_000);
             assert_eq!(msg.attribution.get(), 9999);
-        None
+            None
         }
     }
 

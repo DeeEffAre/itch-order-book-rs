@@ -1,11 +1,16 @@
 use std::ops::{Index, IndexMut};
 
-use crate::itch_parser::{
-    add_order::{AddOrderNoMPID, AddOrderWithMPID},
-    modify_order::order_replace::OrderReplace,
-    system_event_message::SystemEvent,
+use crate::{
+    NumericConversions,
+    itch_parser::{
+        add_order::{AddOrderNoMPID, AddOrderWithMPID},
+        modify_order::order_replace::OrderReplace,
+        system_event_message::SystemEvent,
+    },
+    order_book::bitset::PriceBitset,
 };
 
+mod bitset;
 mod order;
 
 const TICK_SIZE: u64 = 100; // 1-cent tick (0.01$ = 100 in 4dp)
@@ -64,7 +69,7 @@ impl Default for PriceLevel {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Slab {
     orders: Vec<order::Order>,
     free_list: Vec<SlabIndex>,
@@ -97,7 +102,7 @@ impl Slab {
             self.orders[idx.0 as usize] = order;
             idx
         } else {
-            let idx = self.orders.len() as u32;
+            let idx = self.orders.len().as_u32();
             self.orders.push(order);
             SlabIndex(idx)
         }
@@ -132,10 +137,14 @@ impl Slab {
     }
 }
 
+#[derive(Clone)]
 pub struct OrderBook {
+    // tick based price offset
     pub price_offset: Option<u64>,
     pub bids: Vec<PriceLevel>,
     pub asks: Vec<PriceLevel>,
+    pub bid_bitmap: Box<PriceBitset>,
+    pub ask_bitmap: Box<PriceBitset>,
     pub order_pool: Slab,
     pub best_bid: u32,
     pub best_ask: u32,
@@ -147,6 +156,8 @@ impl Default for OrderBook {
             price_offset: None,
             bids: vec![PriceLevel::default(); MAX_PRICE],
             asks: vec![PriceLevel::default(); MAX_PRICE],
+            bid_bitmap: Box::default(),
+            ask_bitmap: Box::default(),
             order_pool: Slab::default(),
             best_bid: 0,
             best_ask: u32::MAX,
@@ -166,7 +177,7 @@ impl OrderBook {
             return None;
         }
 
-        let idx = (tick_price - offset) as usize;
+        let idx = (tick_price - offset).as_idx();
         if idx >= MAX_PRICE {
             return None;
         }
@@ -177,8 +188,9 @@ impl OrderBook {
         })
     }
 
+    #[inline(never)]
     fn shift_prices_down(&mut self, shift: u64) {
-        let shift = shift as usize;
+        let shift = shift.as_idx();
         debug_assert!(shift < MAX_PRICE, "caller rejects shifts >= MAX_PRICE");
 
         // best_bid == 0 is both the "no bids" sentinel and a valid index (lowest price);
@@ -197,12 +209,15 @@ impl OrderBook {
             self.asks[i] = PriceLevel::default();
         }
 
+        self.bid_bitmap.shift_right(shift);
+        self.ask_bitmap.shift_right(shift);
+
         // update bests
         if self.best_bid != 0 || has_bid_at_zero {
-            self.best_bid = self.best_bid.saturating_add(shift as u32);
+            self.best_bid = self.best_bid.saturating_add(shift.as_u32());
         }
         if self.best_ask != u32::MAX {
-            self.best_ask = self.best_ask.saturating_add(shift as u32);
+            self.best_ask = self.best_ask.saturating_add(shift.as_u32());
         }
     }
 
@@ -236,7 +251,7 @@ impl OrderBook {
             .price_offset
             .expect("price_offset should be Some when order exists");
 
-        let price_idx = (tick_price - offset) as usize;
+        let price_idx = (tick_price - offset).as_idx();
 
         if price_idx >= MAX_PRICE {
             // reject out of band orders.
@@ -246,14 +261,10 @@ impl OrderBook {
         let slab_idx = self.order_pool.insert(order);
 
         let level = if order.side == order::Side::Buy {
-            if price_idx as u32 > self.best_bid {
-                self.best_bid = price_idx as u32;
-            }
+            self.best_bid = std::cmp::max(self.best_bid, price_idx.as_u32());
             &mut self.bids[price_idx]
         } else {
-            if (price_idx as u32) < self.best_ask {
-                self.best_ask = price_idx as u32;
-            }
+            self.best_ask = std::cmp::min(self.best_ask, price_idx.as_u32());
             &mut self.asks[price_idx]
         };
 
@@ -266,6 +277,15 @@ impl OrderBook {
             self.order_pool[slab_idx].prev = old_tail;
             level.tail = slab_idx;
         }
+
+        if level.count == 0 {
+            if order.side == order::Side::Buy {
+                self.bid_bitmap.set(price_idx);
+            } else {
+                self.ask_bitmap.set(price_idx);
+            }
+        }
+
         level.volume += order.shares.0;
         level.count += 1;
 
@@ -280,7 +300,7 @@ impl OrderBook {
             .price_offset
             .expect("price_offset should be Some when order exists");
 
-        let price_idx = (tick_price - offset) as usize;
+        let price_idx = (tick_price - offset).as_idx();
 
         if price_idx >= MAX_PRICE {
             return;
@@ -310,26 +330,22 @@ impl OrderBook {
         level.count -= 1;
 
         if level.count == 0 {
-            if order_copy.side == order::Side::Buy && price_idx as u32 == self.best_bid {
-                let mut p = self.best_bid;
-                while p > 0 && self.bids[p as usize].count == 0 {
-                    p -= 1;
+            if order_copy.side == order::Side::Buy {
+                self.bid_bitmap.clear(price_idx);
+                if price_idx.as_u32() == self.best_bid {
+                    self.best_bid = self
+                        .bid_bitmap
+                        .find_last_set_from(price_idx)
+                        .map_or(0, super::NumericConversions::as_u32);
                 }
-                self.best_bid = if self.bids[p as usize].count > 0 {
-                    p
-                } else {
-                    0
-                };
-            } else if order_copy.side == order::Side::Sell && price_idx as u32 == self.best_ask {
-                let mut p = self.best_ask;
-                while (p as usize) < MAX_PRICE && self.asks[p as usize].count == 0 {
-                    p += 1;
+            } else {
+                self.ask_bitmap.clear(price_idx);
+                if price_idx.as_u32() == self.best_ask {
+                    self.best_ask = self
+                        .ask_bitmap
+                        .find_first_set_from(price_idx)
+                        .map_or(u32::MAX, super::NumericConversions::as_u32);
                 }
-                self.best_ask = if (p as usize) < MAX_PRICE && self.asks[p as usize].count > 0 {
-                    p
-                } else {
-                    u32::MAX
-                };
             }
         }
     }
@@ -343,7 +359,7 @@ impl OrderBook {
         let offset = self
             .price_offset
             .expect("price_offset should be Some when order exists");
-        let price_idx = (tick_price - offset) as usize;
+        let price_idx = (tick_price - offset).as_idx();
 
         let level = if order_copy.side == order::Side::Buy {
             &mut self.bids[price_idx]
@@ -370,27 +386,22 @@ impl OrderBook {
             level.count -= 1;
 
             if level.count == 0 {
-                if order_copy.side == order::Side::Buy && price_idx as u32 == self.best_bid {
-                    let mut p = self.best_bid;
-                    while p > 0 && self.bids[p as usize].count == 0 {
-                        p -= 1;
+                if order_copy.side == order::Side::Buy {
+                    self.bid_bitmap.clear(price_idx);
+                    if price_idx.as_u32() == self.best_bid {
+                        self.best_bid = self
+                            .bid_bitmap
+                            .find_last_set_from(price_idx)
+                            .map_or(0, super::NumericConversions::as_u32);
                     }
-                    self.best_bid = if self.bids[p as usize].count > 0 {
-                        p
-                    } else {
-                        0
-                    };
-                } else if order_copy.side == order::Side::Sell && price_idx as u32 == self.best_ask
-                {
-                    let mut p = self.best_ask;
-                    while (p as usize) < MAX_PRICE && self.asks[p as usize].count == 0 {
-                        p += 1;
+                } else {
+                    self.ask_bitmap.clear(price_idx);
+                    if price_idx.as_u32() == self.best_ask {
+                        self.best_ask = self
+                            .ask_bitmap
+                            .find_first_set_from(price_idx)
+                            .map_or(u32::MAX, super::NumericConversions::as_u32);
                     }
-                    self.best_ask = if (p as usize) < MAX_PRICE && self.asks[p as usize].count > 0 {
-                        p
-                    } else {
-                        u32::MAX
-                    };
                 }
             }
             true
@@ -408,16 +419,16 @@ impl OrderBook {
 
     #[inline]
     fn clear_all(&mut self) {
-        for level in &mut self.bids {
-            *level = PriceLevel::default();
-        }
-        for level in &mut self.asks {
-            *level = PriceLevel::default();
-        }
+        self.asks.clear();
+        self.bids.clear();
         self.price_offset = None;
         self.order_pool.clear();
         self.best_bid = 0;
         self.best_ask = u32::MAX;
+        self.bid_bitmap.l1.fill(0);
+        self.bid_bitmap.l2.fill(0);
+        self.ask_bitmap.l1.fill(0);
+        self.ask_bitmap.l2.fill(0);
     }
 }
 
@@ -518,10 +529,6 @@ mod tests {
         buf[36..40].copy_from_slice(&attribution.to_be_bytes());
         buf
     }
-
-
-
-
 
     fn build_order_replace(
         org_order_ref_number: u64,
@@ -935,7 +942,6 @@ mod tests {
         assert_eq!(ob.best_bid, 0);
     }
 
-
     #[test]
     fn execute_full_sell_order() {
         const ID: u64 = 20;
@@ -1013,7 +1019,6 @@ mod tests {
         assert_eq!(order.shares, Quantity(INITIAL_SHARES - EXECUTED));
     }
 
-
     // ---- on_order_delete ----
 
     #[test]
@@ -1051,12 +1056,14 @@ mod tests {
         let mut ob = OrderBook::default();
         let slab_1 = ob
             .add_order_no_mpid(
-                AddOrderNoMPID::new(&build_add_order_no_mpid(ID_1, b'B', SHARES, PRICE, 1)).unwrap(),
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID_1, b'B', SHARES, PRICE, 1))
+                    .unwrap(),
             )
             .unwrap();
         let _slab_2 = ob
             .add_order_no_mpid(
-                AddOrderNoMPID::new(&build_add_order_no_mpid(ID_2, b'B', SHARES, PRICE, 2)).unwrap(),
+                AddOrderNoMPID::new(&build_add_order_no_mpid(ID_2, b'B', SHARES, PRICE, 2))
+                    .unwrap(),
             )
             .unwrap();
 
@@ -1068,7 +1075,6 @@ mod tests {
         assert_eq!(ob.order_pool.len(), 1);
         assert_eq!(best_bid_price(&ob), u64::from(PRICE));
     }
-
 
     #[test]
     fn delete_existing_sell_order() {
@@ -1174,7 +1180,6 @@ mod tests {
         assert_eq!(ob.best_bid, 0);
     }
 
-
     #[test]
     fn cancel_all_sell_order() {
         const ID: u64 = 80;
@@ -1222,7 +1227,9 @@ mod tests {
             .unwrap();
 
         let buf = build_order_replace(OLD_ID, NEW_ID, NEW_SHARES, NEW_PRICE, 200);
-        let new_slab = ob.replace_slab(old_slab, OrderReplace::new(&buf).unwrap()).unwrap();
+        let new_slab = ob
+            .replace_slab(old_slab, OrderReplace::new(&buf).unwrap())
+            .unwrap();
 
         // old price level gone
         assert_eq!(
@@ -1268,7 +1275,9 @@ mod tests {
         );
 
         let buf = build_order_replace(OLD_ID, NEW_ID, NEW_SHARES, PRICE, 200);
-        let _new_slab = ob.replace_slab(old_slab, OrderReplace::new(&buf).unwrap()).unwrap();
+        let _new_slab = ob
+            .replace_slab(old_slab, OrderReplace::new(&buf).unwrap())
+            .unwrap();
 
         let level = ob.get_price_level(Side::Sell, Price::from(PRICE)).unwrap();
         assert_eq!(level.count, 2);
@@ -1276,7 +1285,6 @@ mod tests {
 
         assert_eq!(ob.order_pool.len(), 2);
     }
-
 
     #[test]
     fn replace_preserves_side() {
@@ -1292,7 +1300,9 @@ mod tests {
             .unwrap();
 
         let buf = build_order_replace(OLD_ID, NEW_ID, 200, PRICE, 200);
-        let new_slab = ob.replace_slab(old_slab, OrderReplace::new(&buf).unwrap()).unwrap();
+        let new_slab = ob
+            .replace_slab(old_slab, OrderReplace::new(&buf).unwrap())
+            .unwrap();
 
         assert_eq!(
             ob.get_price_level(Side::Sell, Price::from(PRICE))

@@ -15,10 +15,10 @@ use super::{
 pub trait MessageHandler {
     fn on_system_event(&mut self, msg: &SystemEvent) {}
     fn on_add_order_no_mpid(&mut self, msg: &AddOrderNoMPID) -> Option<SlabIndex> {
-        return None;
+        None
     }
     fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) -> Option<SlabIndex> {
-        return None;
+        None
     }
     fn on_order_cancel(&mut self, msg: &OrderCancel) {}
     fn on_order_delete(&mut self, msg: &OrderDelete) {}

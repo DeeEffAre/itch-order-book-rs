@@ -10,6 +10,7 @@ use order_book_matching_engine::itch_parser::parse_and_dispatch;
 fn length_prefix(messages: &[Vec<u8>]) -> Vec<u8> {
     let mut out = Vec::new();
     for m in messages {
+        #[allow(clippy::cast_possible_truncation)]
         out.extend_from_slice(&(m.len() as u16).to_be_bytes());
         out.extend_from_slice(m);
     }

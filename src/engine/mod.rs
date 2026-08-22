@@ -14,10 +14,10 @@ use crate::{
     order_book::{OrderBook, SlabIndex},
 };
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Engine {
     pub books: Vec<Option<OrderBook>>,
-    /// global order_ref -> (locate, slab index) lookup; one array for all books
+    /// global `order_ref` -> (locate, slab index) lookup; one array for all books
     /// because ITCH order reference numbers are a dense global counter
     pub global_map: GlobalMap,
 }
@@ -38,16 +38,20 @@ impl MessageHandler for Engine {
         let locate = msg.stock_locate.get();
         let slab = self.inline_get_book(locate as usize).add_order_no_mpid(msg);
         if let Some(slab) = slab {
-            self.global_map.set(msg.order_ref_number.get(), locate, slab);
+            self.global_map
+                .set(msg.order_ref_number.get(), locate, slab);
         }
         slab
     }
 
     fn on_add_order_with_mpid(&mut self, msg: &AddOrderWithMPID) -> Option<SlabIndex> {
         let locate = msg.stock_locate.get();
-        let slab = self.inline_get_book(locate as usize).add_order_with_mpid(msg);
+        let slab = self
+            .inline_get_book(locate as usize)
+            .add_order_with_mpid(msg);
         if let Some(slab) = slab {
-            self.global_map.set(msg.order_ref_number.get(), locate, slab);
+            self.global_map
+                .set(msg.order_ref_number.get(), locate, slab);
         }
         slab
     }
@@ -80,7 +84,8 @@ impl MessageHandler for Engine {
             .inline_get_book(locate as usize)
             .replace_slab(old_slab, msg);
         if let Some(new_slab) = new_slab {
-            self.global_map.set(msg.new_order_ref_number.get(), locate, new_slab);
+            self.global_map
+                .set(msg.new_order_ref_number.get(), locate, new_slab);
         }
         self.global_map.remove(msg.org_order_ref_number.get());
     }
