@@ -139,41 +139,4 @@ impl PriceBitset {
 
         None
     }
-
-    /// shifts all bits to the right
-    pub fn shift_right(&mut self, shift: usize) {
-        if shift >= MAX_PRICE {
-            *self = Self::default();
-            return;
-        }
-
-        let word_shift = shift >> 6;
-        let bit_shift = shift & 63;
-
-        let mut new_l1 = [0u64; BITSET_WORDS];
-
-        for (i, &src) in self.l1.iter().enumerate() {
-            if src == 0 {
-                continue;
-            }
-
-            let dst_idx = i + word_shift;
-            if dst_idx < BITSET_WORDS {
-                new_l1[dst_idx] |= src << bit_shift;
-            }
-            if bit_shift > 0 && dst_idx + 1 < BITSET_WORDS {
-                new_l1[dst_idx + 1] |= src >> (64 - bit_shift);
-            }
-        }
-
-        self.l1 = new_l1;
-
-        // rebuild l2
-        self.l2 = [0u64; L2_WORDS];
-        for i in 0..BITSET_WORDS {
-            if self.l1[i] != 0 {
-                self.l2[i >> 6] |= 1u64 << (i & 63);
-            }
-        }
-    }
 }

@@ -16,7 +16,7 @@ mod order;
 const TICK_SIZE: u64 = 100; // 1-cent tick (0.01$ = 100 in 4dp)
 const MAX_PRICE: usize = 100_000; // 100K slots = $1000 range after scaling
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SlabIndex(pub u32);
 
 impl SlabIndex {
@@ -140,14 +140,14 @@ impl Slab {
 #[derive(Clone)]
 pub struct OrderBook {
     // tick based price offset
-    pub price_offset: Option<u64>,
+    price_offset: Option<u64>,
     pub bids: Vec<PriceLevel>,
     pub asks: Vec<PriceLevel>,
-    pub bid_bitmap: Box<PriceBitset>,
-    pub ask_bitmap: Box<PriceBitset>,
+    bid_bitmap: Box<PriceBitset>,
+    ask_bitmap: Box<PriceBitset>,
     pub order_pool: Slab,
-    pub best_bid: u32,
-    pub best_ask: u32,
+    best_bid: u32,
+    best_ask: u32,
 }
 
 impl Default for OrderBook {
@@ -190,35 +190,86 @@ impl OrderBook {
 
     #[inline(never)]
     fn shift_prices_down(&mut self, shift: u64) {
+        let new_offset = self
+            .price_offset
+            .expect("price_offset should be Some when shifting")
+            - shift;
+
         let shift = shift.as_idx();
         debug_assert!(shift < MAX_PRICE, "caller rejects shifts >= MAX_PRICE");
 
-        // best_bid == 0 is both the "no bids" sentinel and a valid index (lowest price);
-        // capture occupancy of slot 0 before the shift zeroes it out
-        let has_bid_at_zero = self.bids[0].count > 0;
+        // clear all price levels
+        for level in &mut self.bids {
+            *level = PriceLevel::default();
+        }
+        for level in &mut self.asks {
+            *level = PriceLevel::default();
+        }
+        *self.bid_bitmap = PriceBitset::default();
+        *self.ask_bitmap = PriceBitset::default();
+        self.best_bid = 0;
+        self.best_ask = u32::MAX;
 
-        // shift bids to right
-        self.bids.copy_within(0..MAX_PRICE - shift, shift);
-        for i in 0..shift {
-            self.bids[i] = PriceLevel::default();
+        // collect active orders
+        let mut is_free = vec![false; self.order_pool.orders.len()];
+        for &free_idx in &self.order_pool.free_list {
+            is_free[free_idx.0 as usize] = true;
+        }
+        let active_slab_indices: Vec<SlabIndex> = (0..self.order_pool.orders.len().as_u32())
+            .filter(|&idx| !is_free[idx as usize])
+            .map(SlabIndex)
+            .collect();
+
+        for slab_idx in active_slab_indices {
+            let order = self.order_pool[slab_idx];
+            let tick_price = order.price.0 / TICK_SIZE;
+
+            if tick_price < new_offset {
+                // out of band
+                continue;
+            }
+
+            let new_price_idx = (tick_price - new_offset).as_idx();
+            if new_price_idx >= MAX_PRICE {
+                // out of band
+                continue;
+            }
+
+            let level = if order.side == order::Side::Buy {
+                self.best_bid = std::cmp::max(self.best_bid, new_price_idx.as_u32());
+                &mut self.bids[new_price_idx]
+            } else {
+                self.best_ask = std::cmp::min(self.best_ask, new_price_idx.as_u32());
+                &mut self.asks[new_price_idx]
+            };
+
+            // Reset linked list pointers (order yeni price level'a giriyor)
+            self.order_pool[slab_idx].prev = SlabIndex::NULL;
+            self.order_pool[slab_idx].next = SlabIndex::NULL;
+
+            if level.tail == SlabIndex::NULL {
+                level.head = slab_idx;
+                level.tail = slab_idx;
+            } else {
+                let old_tail = level.tail;
+                self.order_pool[old_tail].next = slab_idx;
+                self.order_pool[slab_idx].prev = old_tail;
+                level.tail = slab_idx;
+            }
+
+            if level.count == 0 {
+                if order.side == order::Side::Buy {
+                    self.bid_bitmap.set(new_price_idx);
+                } else {
+                    self.ask_bitmap.set(new_price_idx);
+                }
+            }
+
+            level.volume += order.shares.0;
+            level.count += 1;
         }
 
-        // shift asks to right
-        self.asks.copy_within(0..MAX_PRICE - shift, shift);
-        for i in 0..shift {
-            self.asks[i] = PriceLevel::default();
-        }
-
-        self.bid_bitmap.shift_right(shift);
-        self.ask_bitmap.shift_right(shift);
-
-        // update bests
-        if self.best_bid != 0 || has_bid_at_zero {
-            self.best_bid = self.best_bid.saturating_add(shift.as_u32());
-        }
-        if self.best_ask != u32::MAX {
-            self.best_ask = self.best_ask.saturating_add(shift.as_u32());
-        }
+        self.price_offset = Some(new_offset);
     }
 
     fn add_order(&mut self, order: order::Order) -> Option<SlabIndex> {
@@ -419,8 +470,14 @@ impl OrderBook {
 
     #[inline]
     fn clear_all(&mut self) {
-        self.asks.clear();
-        self.bids.clear();
+        // clear all price levels instead of deleting Vec
+        for level in &mut self.bids {
+            *level = PriceLevel::default();
+        }
+        for level in &mut self.asks {
+            *level = PriceLevel::default();
+        }
+
         self.price_offset = None;
         self.order_pool.clear();
         self.best_bid = 0;
